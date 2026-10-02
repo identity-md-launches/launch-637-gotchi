@@ -9,11 +9,15 @@
   "contracts": [
     {
       "contract": "MockAavegotchi",
-      "constructorArgs": ["$owner"]
+      "constructorArgs": [
+        "$owner"
+      ]
     },
     {
       "contract": "MockBaazaar",
-      "constructorArgs": ["$contract:MockAavegotchi"]
+      "constructorArgs": [
+        "$contract:MockAavegotchi"
+      ]
     },
     {
       "contract": "HolderWeightedPicker",
@@ -33,7 +37,9 @@
     },
     {
       "contract": "GotchiFeeHook",
-      "constructorArgs": ["0xE03A1074c86CFeDd5C142C4F04F1a1536e203543"]
+      "constructorArgs": [
+        "0xE03A1074c86CFeDd5C142C4F04F1a1536e203543"
+      ]
     },
     {
       "contract": "FeeSink",
@@ -58,5 +64,5 @@
     "tickSpacing": 60,
     "initialPrice": "79228162514264337593543950336"
   },
-  "notes": "Sepolia only (chainId 11155111); chain selection belongs to deployment policy and is not enforced by these constructors. LaunchToken is the accepted GOTCHI ERC20 with no constructor arguments, admin, post-deployment mint or transfer fee. All listed application constructors are nonpayable and use address arguments. Policy $owner supplies MockAavegotchi's immutable MINTER and FlipEscrow's immutable OPERATOR; the minter creates mock NFTs and the operator queues commit-reveal commitments. Other application modules have no admin withdrawal or upgrade role. GotchiFeeHook takes only the literal Sepolia PoolManager. FeeSink follows it immediately and binds itself once from its constructor; atomic factory deployment prevents interception of the public first binding. Other sibling references are constructor immutables; no initialization calls are included. The manifest pool uses the allowed 3000 fee tier, native ETH, tick spacing 60 and decimal sqrtPriceX96 2^96. The factory supplies its initialization-only guard, LP and MerkleDistributor. That guarded pool has no GotchiFeeHook swap callbacks. ForeverLiquidity defines a separate ETH/GOTCHI pool with LP_FEE=0, tick spacing 60 and GotchiFeeHook; the zero LP fee is a source constant, not this manifest's pool fee. Application constructors neither initialize nor fund that separate pool, and this manifest cannot configure its opening liquidity or mcap. A usable GotchiFeeHook address must have low 14 bits 0x00cc for beforeSwap, afterSwap and both return-delta permissions; salt selection and validation are deployment prerequisites outside this schema. There is no beforeInitialize gate. In a correctly configured hook pool, FEE_BPS=30 skims ETH through PoolManager.take into FeeSink. At MIN_BUY_THRESHOLD=0.01 ether, permissionless nonReentrant triggerBuy buys the cheapest affordable MockBaazaar listing for FlipEscrow; collection alone does not trigger a purchase. Sellers withdraw credited proceeds. The mock flip uses FLIP_BURN_BPS=5000 with BURN_ADDRESS=0x000000000000000000000000000000000000dEaD; missing or withheld reveals can time out to burn, and no eligible winner also burns. Picker participation is opt-in: weights snapshot balances at registration/refresh, with live confirmation of the selected holder; insufficient live balance forfeits. Zero balances, zero/dead addresses, PoolManager and the picker itself are excluded. Accepted sources emit the requested fee, listing, purchase, flip, burn and airdrop events; README.md documents roles, operation and mock-randomness limitations, and abi/ contains the exported ABIs. Base, Diamond/live Baazaar, real Aavegotchi NFTs and VRF migration remain README TODOs only."
+  "notes": "Sepolia only (chainId 11155111); chain selection belongs to deployment policy and is not enforced by these constructors. LaunchToken is the accepted GOTCHI ERC20 with no constructor arguments, admin, post-deployment mint or transfer fee. All listed application constructors are nonpayable and use address arguments. Policy $owner supplies MockAavegotchi's immutable MINTER and FlipEscrow's immutable OPERATOR; the minter creates mock NFTs and the operator queues commit-reveal commitments. Other application modules have no admin withdrawal or upgrade role. GotchiFeeHook takes only the literal Sepolia PoolManager. FeeSink follows it immediately and binds itself once from its constructor; atomic factory deployment prevents interception of the public first binding. Other sibling references are constructor immutables; no initialization calls are included. The manifest pool uses the allowed 3000 fee tier, native ETH, tick spacing 60 and decimal sqrtPriceX96 2^96. The factory supplies its initialization-only guard, LP and MerkleDistributor. GotchiStackDeployer in src/ is a script-path helper whose DEPLOYER is its creator; a factory deploying the hook and FeeSink together obtains the same atomicity, so it is deliberately not listed. That guarded pool has no GotchiFeeHook swap callbacks. ForeverLiquidity defines a separate ETH/GOTCHI pool with LP_FEE=0, tick spacing 60 and GotchiFeeHook; the zero LP fee is a source constant, not this manifest's pool fee. Application constructors neither initialize nor fund that separate pool; anyone may initialize it afterwards through ForeverLiquidity.initializePool and lock liquidity, and this manifest cannot configure its opening liquidity or mcap. A usable GotchiFeeHook address must have low 14 bits 0x00cc for beforeSwap, afterSwap and both return-delta permissions; salt selection and validation are deployment prerequisites outside this schema. There is no beforeInitialize gate. In a correctly configured hook pool, FEE_BPS=30 skims ETH through PoolManager.take into FeeSink. At MIN_BUY_THRESHOLD=0.01 ether, permissionless nonReentrant triggerBuy buys the cheapest MockBaazaar listing for FlipEscrow and reverts when that listing costs more than the balance or more than the MAX_BUY_PRICE=0.1 ether constant; collection alone does not trigger a purchase. Sellers withdraw credited proceeds. The mock flip uses FLIP_BURN_BPS=5000 with BURN_ADDRESS=0x000000000000000000000000000000000000dEaD; missing or withheld reveals can time out to burn, and no eligible winner also burns. Picker participation is opt-in: weights snapshot balances at registration/refresh, with live confirmation of the selected holder; insufficient live balance forfeits. Zero balances, zero/dead addresses, PoolManager and the picker itself are excluded. Accepted sources emit the requested fee, listing, purchase, flip, burn and airdrop events; README.md documents roles, operation and mock-randomness limitations, and abi/ contains the exported ABIs. Base, Diamond/live Baazaar, real Aavegotchi NFTs and VRF migration remain README TODOs only."
 }
