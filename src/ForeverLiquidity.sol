@@ -4,7 +4,6 @@ pragma solidity 0.8.26;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
@@ -18,6 +17,7 @@ import {SqrtPriceMath} from "v4-core/src/libraries/SqrtPriceMath.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {FullMath} from "v4-core/src/libraries/FullMath.sol";
 import {FixedPoint96} from "v4-core/src/libraries/FixedPoint96.sol";
+import {PriceMath} from "./PriceMath.sol";
 
 /// @title ForeverLiquidity
 /// @notice Owns the ETH/$GOTCHI Uniswap v4 pool's full-range position and never gives it back: there is
@@ -71,7 +71,7 @@ contract ForeverLiquidity is IUnlockCallback, ReentrancyGuard {
     error InsufficientToken(uint256 needed, uint256 provided);
     error UnexpectedDelta();
     error RefundFailed();
-    error PriceOutOfRange();
+    error PriceOutsideBounds(uint160 sqrtPriceX96, uint160 minSqrtPriceX96, uint160 maxSqrtPriceX96);
 
     modifier onlyPoolManager() {
         if (msg.sender != address(POOL_MANAGER)) revert NotPoolManager();
@@ -106,7 +106,8 @@ contract ForeverLiquidity is IUnlockCallback, ReentrancyGuard {
     }
 
     /// @notice Initializes the pool at `sqrtPriceX96`. Anyone may call; the PoolManager rejects a
-    /// second initialization. The deploy script does this right before adding liquidity.
+    /// second initialization. `GotchiStackDeployer` does this in the same transaction that creates this
+    /// contract, so nobody can pin the pool at another price first.
     function initializePool(uint160 sqrtPriceX96) external nonReentrant returns (int24 tick) {
         tick = POOL_MANAGER.initialize(poolKey(), sqrtPriceX96);
     }
@@ -117,13 +118,37 @@ contract ForeverLiquidity is IUnlockCallback, ReentrancyGuard {
 
     /// @notice Adds `liquidity` to the full-range position, paying with `msg.value` of ETH and up to
     /// `maxTokenAmount` of $GOTCHI pulled from the caller (approve first). Unused ETH and tokens are
-    /// returned. The liquidity can never be withdrawn.
+    /// returned. The liquidity can never be withdrawn. Quotes at whatever price the pool has; use
+    /// `addLiquidityWithin` to insist on a price band.
     /// @return amountEth ETH actually used.
     /// @return amountToken $GOTCHI actually used.
     function addLiquidity(uint128 liquidity, uint256 maxTokenAmount)
         external
         payable
         nonReentrant
+        returns (uint256 amountEth, uint256 amountToken)
+    {
+        return _addLiquidity(liquidity, maxTokenAmount);
+    }
+
+    /// @notice `addLiquidity` that reverts unless the pool's current sqrtPriceX96 lies within
+    /// [`minSqrtPriceX96`, `maxSqrtPriceX96`], so a deposit computed for one price can never be taken at
+    /// another (a pool initialized or moved by someone else before the deposit lands).
+    function addLiquidityWithin(
+        uint128 liquidity,
+        uint256 maxTokenAmount,
+        uint160 minSqrtPriceX96,
+        uint160 maxSqrtPriceX96
+    ) external payable nonReentrant returns (uint256 amountEth, uint256 amountToken) {
+        (uint160 sqrtPriceX96,,,) = POOL_MANAGER.getSlot0(poolId());
+        if (sqrtPriceX96 < minSqrtPriceX96 || sqrtPriceX96 > maxSqrtPriceX96) {
+            revert PriceOutsideBounds(sqrtPriceX96, minSqrtPriceX96, maxSqrtPriceX96);
+        }
+        return _addLiquidity(liquidity, maxTokenAmount);
+    }
+
+    function _addLiquidity(uint128 liquidity, uint256 maxTokenAmount)
+        private
         returns (uint256 amountEth, uint256 amountToken)
     {
         if (liquidity < 1) revert ZeroLiquidity();
@@ -194,13 +219,12 @@ contract ForeverLiquidity is IUnlockCallback, ReentrancyGuard {
     // Quoting helpers
     // ---------------------------------------------------------------------------------------------
 
-    /// @notice The sqrtPriceX96 at which `tokenAmount` of $GOTCHI is worth `ethAmount` of ETH.
+    /// @notice The sqrtPriceX96 at which `tokenAmount` of $GOTCHI is worth `ethAmount` of ETH. Reverts
+    /// `ZeroLiquidity` on a zero amount and `PriceOutOfRange` when the ratio cannot be represented or lies
+    /// outside the pool's tick range (see `PriceMath`).
     function sqrtPriceX96ForAmounts(uint256 ethAmount, uint256 tokenAmount) public pure returns (uint160) {
         if (ethAmount < 1 || tokenAmount < 1) revert ZeroLiquidity();
-        uint256 ratioX192 = Math.mulDiv(tokenAmount, 1 << 192, ethAmount);
-        uint256 sqrtPriceX96 = Math.sqrt(ratioX192);
-        if (sqrtPriceX96 > type(uint160).max) revert PriceOutOfRange();
-        return uint160(sqrtPriceX96);
+        return PriceMath.sqrtPriceX96ForAmounts(ethAmount, tokenAmount);
     }
 
     /// @notice The ETH and $GOTCHI the pool will charge for `liquidity` at the current price, computed

@@ -18,11 +18,17 @@ import {FlipEscrow} from "./FlipEscrow.sol";
 /// `triggerBuy` for exactly the price `triggerBuy` armed. Reentrancy: `triggerBuy` is `nonReentrant`,
 /// `payForListing` disarms before paying, and the Baazaar/NFT/escrow addresses are immutable.
 ///
-/// No admin role: nobody can withdraw, redirect or change the threshold. Donations are accepted and
-/// spent the same way as fees.
+/// Price bound: a purchase never pays more than `MAX_BUY_PRICE`, however much the sink holds, so whoever
+/// controls the cheapest listing can extract at most that much fee ETH per gotchi (and half of those are
+/// burned). Listings above the cap simply wait until a cheaper one appears.
+///
+/// No admin role: nobody can withdraw, redirect or change the threshold or the cap. Donations are
+/// accepted and spent the same way as fees.
 contract FeeSink is IBaazaarBuyer, ReentrancyGuard {
     /// @notice Balance at or above which `triggerBuy` is allowed.
     uint256 public constant MIN_BUY_THRESHOLD = 0.01 ether;
+    /// @notice The most a single purchase may pay (10x the threshold); configurable constant.
+    uint256 public constant MAX_BUY_PRICE = 0.1 ether;
 
     /// @notice The hook that feeds this sink (bound in the constructor).
     GotchiFeeHook public immutable HOOK;
@@ -49,6 +55,7 @@ contract FeeSink is IBaazaarBuyer, ReentrancyGuard {
     error BelowThreshold(uint256 balance, uint256 threshold);
     error NoListing();
     error CannotAfford(uint256 price, uint256 balance);
+    error PriceAboveCap(uint256 price, uint256 cap);
     error NotBaazaar();
     error UnexpectedPayment(uint256 amount, uint256 expected);
     error PaymentFailed();
@@ -74,7 +81,7 @@ contract FeeSink is IBaazaarBuyer, ReentrancyGuard {
     // ---------------------------------------------------------------------------------------------
 
     /// @notice Buys the cheapest listing for the escrow. Reverts below the threshold, without a
-    /// listing, or when the cheapest listing costs more than the balance.
+    /// listing, when the cheapest listing costs more than the balance, or more than `MAX_BUY_PRICE`.
     /// @return acquisitionId The escrow's id for the bought gotchi.
     function triggerBuy() external nonReentrant returns (uint256 acquisitionId) {
         uint256 balance = address(this).balance;
@@ -82,6 +89,7 @@ contract FeeSink is IBaazaarBuyer, ReentrancyGuard {
         (bool found, uint256 listingId, uint256 tokenId, uint256 price, address seller) = BAAZAAR.cheapest();
         if (!found || seller == address(0)) revert NoListing();
         if (price > balance) revert CannotAfford(price, balance);
+        if (price > MAX_BUY_PRICE) revert PriceAboveCap(price, MAX_BUY_PRICE);
 
         acquisitionId = ESCROW.acquisitionCount();
         pendingPayment = price;
@@ -127,6 +135,8 @@ contract FeeSink is IBaazaarBuyer, ReentrancyGuard {
             reason = "no listing";
         } else if (price > balance) {
             reason = "cannot afford cheapest listing";
+        } else if (price > MAX_BUY_PRICE) {
+            reason = "cheapest listing above price cap";
         } else {
             ok = true;
         }

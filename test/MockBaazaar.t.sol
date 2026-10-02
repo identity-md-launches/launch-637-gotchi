@@ -152,6 +152,70 @@ contract MockBaazaarTest is GotchiFixture {
         assertEq(price, 3 ether);
     }
 
+    function test_activeIndexSwapsAndPopsOnCancelAndSale() public {
+        (uint256 l1,) = mintAndList(seller, 1 ether);
+        (uint256 l2,) = mintAndList(seller, 2 ether);
+        (uint256 l3,) = mintAndList(seller, 3 ether);
+        assertEq(baazaar.activeListingIdAt(0), l1);
+        assertEq(baazaar.activeListingIdAt(1), l2);
+        assertEq(baazaar.activeListingIdAt(2), l3);
+        vm.prank(seller);
+        baazaar.cancel(l1); // l3 moves into slot 0
+        assertEq(baazaar.activeCount(), 2);
+        assertEq(baazaar.activeListingIdAt(0), l3);
+        assertEq(baazaar.activeListingIdAt(1), l2);
+        vm.prank(buyer);
+        baazaar.buyCheapest{value: 2 ether}(buyer, 2 ether); // l2 was last: plain pop
+        assertEq(baazaar.activeCount(), 1);
+        assertEq(baazaar.activeListingIdAt(0), l3);
+        (bool found, uint256 listingId,,,) = baazaar.cheapest();
+        assertTrue(found);
+        assertEq(listingId, l3);
+        vm.expectRevert();
+        baazaar.activeListingIdAt(1);
+    }
+
+    function test_cheapestCostDoesNotGrowWithCancelledListings() public {
+        (uint256 goodListing,) = mintAndList(seller, 0.5 ether);
+        (, uint256 junk) = mintAndList(seller, 1 ether);
+        vm.startPrank(seller);
+        nft.setApprovalForAll(address(baazaar), true);
+        baazaar.cancel(2);
+        for (uint256 i = 0; i < 2_000; i++) {
+            uint256 id = baazaar.list(junk, 1 ether);
+            baazaar.cancel(id);
+        }
+        vm.stopPrank();
+        assertEq(baazaar.listingCount(), 2_002);
+        assertEq(baazaar.activeCount(), 1);
+
+        // The scan reads one active id and one listing: a few cold slots, nowhere near the ~2,800 gas per
+        // dead listing the old full scan paid (about 5.6M here, and above a block for 11k dead listings).
+        uint256 before = gasleft();
+        (bool found, uint256 listingId,,,) = baazaar.cheapest();
+        uint256 withDeadListings = before - gasleft();
+        assertTrue(found);
+        assertEq(listingId, goodListing);
+        assertLt(withDeadListings, 40_000, "dead listings add nothing to the scan");
+    }
+
+    function test_cheapestTieBreaksToTheOldestEvenWhenTheIndexIsReordered() public {
+        (uint256 l1,) = mintAndList(seller, 2 ether);
+        (uint256 l2,) = mintAndList(seller, 1 ether);
+        (uint256 l3,) = mintAndList(seller, 1 ether);
+        vm.prank(seller);
+        baazaar.cancel(l1); // l3 now sits before l2 in the index
+        assertEq(baazaar.activeListingIdAt(0), l3);
+        (, uint256 listingId,,,) = baazaar.cheapest();
+        assertEq(listingId, l2, "lowest id wins the tie regardless of index order");
+    }
+
+    function test_strayEthIsRefused() public {
+        (bool ok,) = address(baazaar).call{value: 1 wei}("");
+        assertFalse(ok, "nobody could ever withdraw it");
+        assertEq(address(baazaar).balance, 0);
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Buying with msg.value
     // ---------------------------------------------------------------------------------------------

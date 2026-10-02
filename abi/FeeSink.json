@@ -65,6 +65,19 @@
   },
   {
     "type": "function",
+    "name": "MAX_BUY_PRICE",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "MIN_BUY_THRESHOLD",
     "inputs": [],
     "outputs": [
@@ -292,6 +305,22 @@
     "type": "error",
     "name": "PaymentNotCollected",
     "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "PriceAboveCap",
+    "inputs": [
+      {
+        "name": "price",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "cap",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
   },
   {
     "type": "error",

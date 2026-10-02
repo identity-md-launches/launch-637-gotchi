@@ -8,8 +8,11 @@ import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
 
+import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+
 import {GotchiFixture} from "./utils/GotchiFixture.sol";
 import {ForeverLiquidity} from "../src/ForeverLiquidity.sol";
+import {PriceMath} from "../src/PriceMath.sol";
 
 contract ForeverLiquidityTest is GotchiFixture {
     using StateLibrary for IPoolManager;
@@ -79,6 +82,42 @@ contract ForeverLiquidityTest is GotchiFixture {
         forever.sqrtPriceX96ForAmounts(0, 1);
         vm.expectRevert(ForeverLiquidity.ZeroLiquidity.selector);
         forever.sqrtPriceX96ForAmounts(1, 0);
+    }
+
+    function test_sqrtPriceRejectsUnrepresentableAndOutOfRangeRatios() public {
+        // 2^64 tokens per wei would overflow the 192-bit ratio: a clean error, not a panic.
+        vm.expectRevert(PriceMath.PriceOutOfRange.selector);
+        forever.sqrtPriceX96ForAmounts(1, uint256(1) << 64);
+        vm.expectRevert(PriceMath.PriceOutOfRange.selector);
+        forever.sqrtPriceX96ForAmounts(1, type(uint256).max);
+        // Representable but outside the tick range (about 2^-128 tokens per wei).
+        vm.expectRevert(PriceMath.PriceOutOfRange.selector);
+        forever.sqrtPriceX96ForAmounts(uint256(1) << 130, 1);
+        // The extremes that are inside the range work.
+        assertGe(forever.sqrtPriceX96ForAmounts(1, (uint256(1) << 64) - 1), TickMath.MIN_SQRT_PRICE);
+        assertLt(forever.sqrtPriceX96ForAmounts(1 << 100, 1), TickMath.MAX_SQRT_PRICE);
+    }
+
+    function test_addLiquidityWithinEnforcesThePriceBand() public {
+        uint160 spot = forever.sqrtPriceX96ForAmounts(INITIAL_ETH, INITIAL_TOKENS);
+        uint128 liquidity = forever.liquidityForAmounts(1 ether, 10_000_000e18);
+        token.approve(address(forever), type(uint256).max);
+
+        // The pool moved (someone swapped) between quoting and depositing: the guarded call refuses.
+        swap(key, true, -1 ether);
+        (uint160 moved,,,) = pm.getSlot0(forever.poolId());
+        assertTrue(moved != spot);
+        vm.expectRevert(abi.encodeWithSelector(ForeverLiquidity.PriceOutsideBounds.selector, moved, spot, spot));
+        forever.addLiquidityWithin{value: 1 ether}(liquidity, 10_000_000e18, spot, spot);
+
+        // A band that contains the live price goes through and behaves like addLiquidity.
+        uint128 live = forever.liquidityForAmounts(1 ether, 10_000_000e18);
+        (uint256 needEth, uint256 needTok) = forever.amountsForLiquidity(live);
+        (uint256 usedEth, uint256 usedTok) =
+            forever.addLiquidityWithin{value: 1 ether}(live, 10_000_000e18, moved - 1, moved + 1);
+        assertEq(usedEth, needEth);
+        assertEq(usedTok, needTok);
+        assertEq(forever.totalLiquidity(), uint256(seededLiquidity) + live);
     }
 
     function test_quotedLiquidityFitsTheBudgets() public view {

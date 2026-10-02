@@ -301,6 +301,11 @@
             "internalType": "bytes32"
           },
           {
+            "name": "pickerVersion",
+            "type": "uint256",
+            "internalType": "uint256"
+          },
+          {
             "name": "burned",
             "type": "bool",
             "internalType": "bool"
@@ -374,6 +379,30 @@
       }
     ],
     "stateMutability": "pure"
+  },
+  {
+    "type": "function",
+    "name": "latestAcquisitionOf",
+    "inputs": [
+      {
+        "name": "tokenId",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "found",
+        "type": "bool",
+        "internalType": "bool"
+      },
+      {
+        "name": "acquisitionId",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
   },
   {
     "type": "function",
@@ -476,6 +505,19 @@
       }
     ],
     "stateMutability": "pure"
+  },
+  {
+    "type": "function",
+    "name": "sweepStray",
+    "inputs": [
+      {
+        "name": "tokenId",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
   },
   {
     "type": "event",
@@ -648,6 +690,19 @@
     "anonymous": false
   },
   {
+    "type": "event",
+    "name": "StraySwept",
+    "inputs": [
+      {
+        "name": "tokenId",
+        "type": "uint256",
+        "indexed": true,
+        "internalType": "uint256"
+      }
+    ],
+    "anonymous": false
+  },
+  {
     "type": "error",
     "name": "BadSecret",
     "inputs": []
@@ -699,6 +754,17 @@
     "type": "error",
     "name": "NotOperator",
     "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "NotStray",
+    "inputs": [
+      {
+        "name": "tokenId",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
   },
   {
     "type": "error",

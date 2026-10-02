@@ -2,7 +2,9 @@
 pragma solidity 0.8.26;
 
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
+import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
@@ -10,6 +12,7 @@ import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
 import {TestERC20} from "v4-core/src/test/TestERC20.sol";
+import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 
 import {GotchiFixture} from "./utils/GotchiFixture.sol";
 import {GotchiFeeHook} from "../src/GotchiFeeHook.sol";
@@ -18,6 +21,7 @@ import {FeeSink} from "../src/FeeSink.sol";
 
 contract GotchiFeeHookTest is GotchiFixture {
     using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
 
     uint256 constant BPS = 10_000;
 
@@ -167,6 +171,106 @@ contract GotchiFeeHookTest is GotchiFixture {
         assertEq(address(sink).balance, 0.003 ether + 0.006 ether + 0.0015 ether);
         assertEq(sink.totalCollected(), address(sink).balance);
         _assertHookHoldsNothing();
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Price-limited (partially filled) swaps with ETH specified
+    // ---------------------------------------------------------------------------------------------
+
+    function _spot() internal view returns (uint160 sqrtPriceX96) {
+        (sqrtPriceX96,,,) = IPoolManager(address(manager)).getSlot0(key.toId());
+    }
+
+    function _limitedSwap(PoolKey memory k, bool zeroForOne, int256 amountSpecified, uint160 limit)
+        internal
+        returns (BalanceDelta)
+    {
+        uint256 value = zeroForOne ? (amountSpecified < 0 ? uint256(-amountSpecified) : 100 ether) : 0;
+        return swapRouter.swap{value: value}(
+            k,
+            SwapParams({zeroForOne: zeroForOne, amountSpecified: amountSpecified, sqrtPriceLimitX96: limit}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+    }
+
+    function test_exactOutputEthPartialFill_chargesThirtyBpsOfTheEthMoved() public {
+        uint160 limit = uint160(uint256(_spot()) * 10001 / 10000);
+        SwapParams memory params = SwapParams(false, 1 ether, limit);
+        uint256 fillable = hook.ethToLimit(key, params);
+        assertLt(fillable, 1 ether, "the limit cuts the swap short");
+        uint256 expectedFee = hook.feeFor(fillable);
+        assertEq(hook.specifiedFeeFor(key, params), expectedFee);
+
+        BalanceDelta plain = _limitedSwap(plainKey, false, 1 ether, limit);
+        BalanceDelta hooked = _limitedSwap(key, false, 1 ether, limit);
+        uint256 fee = address(sink).balance;
+
+        assertEq(fee, expectedFee);
+        assertEq(uint256(int256(plain.amount0())), fillable, "the estimate matches the pool's own fill");
+        assertGe(hooked.amount0(), 0, "an ETH buyer never pays ETH");
+        assertEq(uint256(int256(hooked.amount0())) + fee, fillable, "trader nets the fill minus the fee");
+        assertLe(fee, hook.feeFor(uint256(int256(hooked.amount0())) + fee));
+        assertEq(hooked.amount1(), plain.amount1(), "same GOTCHI paid for the same price move");
+        _assertHookHoldsNothing();
+    }
+
+    function test_exactInputEthPartialFill_chargesThirtyBpsOfTheEthMoved() public {
+        uint160 limit = uint160(uint256(_spot()) * 9999 / 10000);
+        SwapParams memory params = SwapParams(true, -1 ether, limit);
+        uint256 fillable = hook.ethToLimit(key, params);
+        assertLt(fillable, 1 ether);
+        uint256 expectedFee = hook.feeFor(fillable);
+
+        BalanceDelta plain = _limitedSwap(plainKey, true, -1 ether, limit);
+        BalanceDelta hooked = _limitedSwap(key, true, -1 ether, limit);
+        uint256 fee = address(sink).balance;
+
+        assertEq(fee, expectedFee);
+        assertEq(uint256(-int256(plain.amount0())), fillable);
+        uint256 paid = uint256(-int256(hooked.amount0()));
+        assertEq(paid, fillable + fee, "trader pays the fill plus 30 bps of it, not 30 bps of the request");
+        assertLe(fee, hook.feeFor(paid));
+        assertEq(hooked.amount1(), plain.amount1());
+        _assertHookHoldsNothing();
+    }
+
+    function test_fullFillsAreUnaffectedByTheLimitEstimate() public {
+        // A limit far enough away: the swap fills completely and pays 30 bps of its amount as before.
+        uint160 limit = uint160(uint256(_spot()) * 11 / 10);
+        SwapParams memory params = SwapParams(false, 0.01 ether, limit);
+        assertGt(hook.ethToLimit(key, params), 0.01 ether);
+        assertEq(hook.specifiedFeeFor(key, params), 0.00003 ether);
+        BalanceDelta hooked = _limitedSwap(key, false, 0.01 ether, limit);
+        assertEq(hooked.amount0(), 0.01 ether);
+        assertEq(address(sink).balance, 0.00003 ether);
+    }
+
+    function test_ethToLimitIsUnboundedForLimitsThePoolRejects() public view {
+        uint160 spot = _spot();
+        assertEq(hook.ethToLimit(key, SwapParams(true, -1 ether, spot)), type(uint256).max);
+        assertEq(hook.ethToLimit(key, SwapParams(true, -1 ether, spot + 1)), type(uint256).max);
+        assertEq(hook.ethToLimit(key, SwapParams(false, 1 ether, spot)), type(uint256).max);
+        assertEq(hook.ethToLimit(key, SwapParams(false, 1 ether, spot - 1)), type(uint256).max);
+        assertEq(hook.ethToLimit(key, SwapParams(true, -1 ether, 0)), type(uint256).max);
+        assertEq(hook.ethToLimit(key, SwapParams(false, 1 ether, type(uint160).max)), type(uint256).max);
+        assertEq(hook.specifiedFeeFor(key, SwapParams(true, -1 ether, spot)), 0.003 ether);
+    }
+
+    function test_liquidityShapedToShrinkTheFeeIsRejected() public {
+        // A deep ETH-only position just above the spot, invisible to the spot-liquidity estimate.
+        (, int24 tick,,) = IPoolManager(address(manager)).getSlot0(key.toId());
+        int24 lower = (tick / 60 + 2) * 60;
+        int24 upper = lower + 600;
+        lpRouter.modifyLiquidity{value: 10 ether}(
+            key, ModifyLiquidityParams(lower, upper, int256(uint256(seededLiquidity)) * 20, bytes32(0)), ""
+        );
+        uint160 limit = TickMath.getSqrtPriceAtTick(upper + 60);
+        SwapParams memory params = SwapParams(false, 1 ether, limit);
+        assertLt(hook.ethToLimit(key, params), 1 ether, "the spot-liquidity estimate undershoots the fill");
+        vm.expectRevert(); // FeeOutOfBounds, wrapped by the PoolManager's hook call
+        _limitedSwap(key, false, 1 ether, limit);
+        assertEq(address(sink).balance, 0, "nothing was taken");
     }
 
     function test_tinySwapRoundsFeeDownToZeroWithoutReverting() public {

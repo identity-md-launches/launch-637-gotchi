@@ -172,18 +172,171 @@ contract HolderWeightedPickerTest is Test {
         }
     }
 
-    function test_pickForfeitsWhenLiveBalanceFellBelowStoredWeight() public {
+    function test_pickRedrawsWhenLiveBalanceFellBelowStoredWeight() public {
         _registerTrio();
         vm.prank(carol);
         token.transfer(address(0xBEEF), 1);
+        // The first draw (50e18) lands on carol, whose weight is stale; the picker re-draws deterministically.
         (address winner, uint256 weight) = picker.pick(50e18);
-        assertEq(winner, address(0), "stale weight forfeits");
-        assertEq(weight, 0);
+        (address expected, uint256 expectedWeight) = _expectedWithRedraws(50e18, carol);
+        assertEq(winner, expected, "re-draw sequence");
+        assertEq(weight, expectedWeight);
+        assertTrue(winner != carol, "a stale holder never wins");
         // Other holders are unaffected.
         _assertPick(5e18, alice, 10e18);
         // After a refresh carol is eligible again with the live weight.
         picker.refresh(carol);
         _assertPick(50e18, carol, 60e18 - 1);
+    }
+
+    function test_pickForfeitsOnlyWhenEveryDrawIsStale() public {
+        _registerTrio();
+        vm.startPrank(alice);
+        token.transfer(address(0xBEEF), 1);
+        vm.stopPrank();
+        vm.prank(bob);
+        token.transfer(address(0xBEEF), 1);
+        vm.prank(carol);
+        token.transfer(address(0xBEEF), 1);
+        (address winner, uint256 weight) = picker.pick(50e18);
+        assertEq(winner, address(0), "every draw stale: forfeit");
+        assertEq(weight, 0);
+    }
+
+    function test_staleSybilEntriesDoNotTurnHonestAirdropsIntoBurns() public {
+        // One 100-token bag registered through ten wallets leaves nine stale entries behind.
+        _fundAndRegister(alice, 100e18);
+        address bag = address(uint160(0x5000));
+        token.transfer(bag, 100e18);
+        for (uint256 i = 0; i < 10; i++) {
+            address next = address(uint160(0x5000 + i + 1));
+            vm.startPrank(bag);
+            picker.register();
+            if (i < 9) token.transfer(next, 100e18);
+            vm.stopPrank();
+            if (i < 9) bag = next;
+        }
+        assertEq(picker.totalWeight(), 1_100e18);
+        // Without re-draws alice would win 10 of 110 flips and 90 would burn. The escrow resolves through
+        // `drawAt`, which re-draws past stale entries and refreshes them away, so the registry converges to
+        // the two live holders (alice and the wallet holding the bag) within the first few flips.
+        uint256 aliceWins = 0;
+        uint256 burns = 0;
+        for (uint256 r = 0; r < 110; r++) {
+            (address winner,) = picker.drawAt(picker.version(), uint256(keccak256(abi.encode("flip", r))));
+            if (winner == alice) aliceWins++;
+            if (winner == address(0)) burns++;
+        }
+        assertGt(aliceWins, 40, "alice keeps a real share of the airdrops");
+        assertLt(burns, 5, "stale entries rarely turn into burns");
+        assertEq(picker.totalWeight(), 200e18, "the stale entries were refreshed to zero");
+        // A view-only pick keeps the same semantics minus the cleanup.
+        (address viewWinner,) = picker.pick(0);
+        assertEq(viewWinner, alice);
+    }
+
+    function test_drawAtMatchesPickAtAndOnlyRefreshesStaleHolders() public {
+        _registerTrio();
+        uint256 frozen = picker.version();
+        vm.prank(carol);
+        token.transfer(address(0xBEEF), 1);
+        (address expected, uint256 expectedWeight) = picker.pickAt(frozen, 50e18);
+        (address winner, uint256 weight) = picker.drawAt(frozen, 50e18);
+        assertEq(winner, expected);
+        assertEq(weight, expectedWeight);
+        assertEq(picker.weightOf(carol), 60e18 - 1, "carol was refreshed when her stale entry was drawn");
+        assertEq(picker.weightOf(alice), 10e18);
+        assertEq(picker.weightOf(bob), 30e18);
+        assertEq(picker.totalWeightAt(frozen), 100e18, "the snapshot is untouched");
+        // No stale holders: no refreshes, no version change.
+        uint256 before = picker.version();
+        picker.drawAt(picker.version(), 5e18);
+        assertEq(picker.version(), before);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Versioned snapshots
+    // ---------------------------------------------------------------------------------------------
+
+    function test_versionBumpsOnEveryEffectiveMutation() public {
+        assertEq(picker.version(), 0);
+        _registerTrio();
+        assertEq(picker.version(), 3);
+        picker.refresh(alice); // unchanged balance: no new version
+        assertEq(picker.version(), 3);
+        token.transfer(alice, 1e18);
+        picker.refresh(alice);
+        assertEq(picker.version(), 4);
+        assertEq(picker.holderCountAt(0), 0);
+        assertEq(picker.holderCountAt(2), 2);
+        assertEq(picker.holderCountAt(4), 3);
+        assertEq(picker.totalWeightAt(1), 10e18);
+        assertEq(picker.totalWeightAt(3), 100e18);
+        assertEq(picker.totalWeightAt(4), 101e18);
+        assertEq(picker.totalWeightAt(999), 101e18, "future versions read the latest state");
+        assertEq(picker.weightOfAt(alice, 0), 0);
+        assertEq(picker.weightOfAt(alice, 3), 10e18);
+        assertEq(picker.weightOfAt(alice, 4), 11e18);
+    }
+
+    function test_pickAtIgnoresLaterRegistrationsAndRefreshes() public {
+        _registerTrio();
+        uint256 frozen = picker.version();
+        // alice [0,10), bob [10,40), carol [40,100) at the frozen version.
+        _fundAndRegister(makeAddr("late"), 1_000_000e18);
+        token.transfer(alice, 1_000_000e18);
+        picker.refresh(alice);
+        (address winner, uint256 weight) = picker.pickAt(frozen, 50e18);
+        assertEq(winner, carol);
+        assertEq(weight, 60e18, "the snapshot weight, not the live one");
+        (winner, weight) = picker.pickAt(frozen, 5e18);
+        assertEq(winner, alice);
+        assertEq(weight, 10e18);
+        (winner,) = picker.pickAt(frozen, 100e18 + 15e18);
+        assertEq(winner, bob, "modulo the snapshot total");
+        // The live pick sees the new state: late's range starts after alice's refreshed 1,000,010 tokens
+        // plus bob's and carol's.
+        (winner,) = picker.pick(1_000_100e18 + 1);
+        assertEq(winner, makeAddr("late"));
+        (winner,) = picker.pick(200e18);
+        assertEq(winner, alice);
+    }
+
+    function test_pickAtBeforeAnyRegistrationIsEmpty() public {
+        _registerTrio();
+        (address winner, uint256 weight) = picker.pickAt(0, 12345);
+        assertEq(winner, address(0));
+        assertEq(weight, 0);
+    }
+
+    function test_pickAtStillConfirmsTheLiveBalanceAgainstTheSnapshotWeight() public {
+        _registerTrio();
+        uint256 frozen = picker.version();
+        vm.prank(carol);
+        token.transfer(address(0xBEEF), 1);
+        picker.refresh(carol); // live state is consistent again, but the snapshot says 60e18
+        (address winner,) = picker.pickAt(frozen, 50e18);
+        assertTrue(winner != carol, "carol holds less than her snapshot weight");
+        (address live,) = picker.pick(50e18);
+        assertEq(live, carol, "against the current version she is fine");
+    }
+
+    function test_registryHasNoCapacityCap() public {
+        // Far more than the old 2^16 would be impractical in a test; what matters is that nothing in the
+        // tree depends on a fixed size: positions past any power of two keep selecting correctly.
+        uint256 n = 300;
+        for (uint256 i = 0; i < n; i++) {
+            _fundAndRegister(address(uint160(0x2000 + i)), 1e18);
+        }
+        assertEq(picker.holderCount(), n);
+        assertEq(picker.totalWeight(), n * 1e18);
+        for (uint256 i = 0; i < n; i += 7) {
+            (address winner, uint256 weight) = picker.pick(i * 1e18 + 5);
+            assertEq(winner, address(uint160(0x2000 + i)));
+            assertEq(weight, 1e18);
+        }
+        (address last,) = picker.pick(n * 1e18 - 1);
+        assertEq(last, address(uint160(0x2000 + n - 1)));
     }
 
     function test_pickToleratesLiveBalanceAboveStoredWeight() public {
@@ -233,5 +386,15 @@ contract HolderWeightedPickerTest is Test {
         if (target < 10e18) return alice;
         if (target < 40e18) return bob;
         return carol;
+    }
+
+    /// @dev Replays the picker's draw sequence for the trio with `stale` forfeiting every time.
+    function _expectedWithRedraws(uint256 randomness, address stale) internal view returns (address, uint256) {
+        for (uint256 draw = 0; draw < picker.MAX_DRAWS(); draw++) {
+            uint256 roll = draw == 0 ? randomness : uint256(keccak256(abi.encode(randomness, draw)));
+            address candidate = _expectedFor(roll % 100e18);
+            if (candidate != stale) return (candidate, picker.weightOf(candidate));
+        }
+        return (address(0), 0);
     }
 }

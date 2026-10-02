@@ -71,6 +71,28 @@ contract FeeSinkTest is GotchiFixture {
         sink.triggerBuy();
     }
 
+    function test_triggerBuyRevertsAboveThePriceCapEvenWhenAffordable() public {
+        uint256 cap = sink.MAX_BUY_PRICE();
+        assertEq(cap, 0.1 ether);
+        (, uint256 id) = mintAndList(seller, cap + 1);
+        _fund(5 ether);
+        (bool ok, string memory reason,,, uint256 price,) = sink.canBuy();
+        assertFalse(ok);
+        assertEq(reason, "cheapest listing above price cap");
+        assertEq(price, cap + 1);
+        vm.expectRevert(abi.encodeWithSelector(FeeSink.PriceAboveCap.selector, cap + 1, cap));
+        sink.triggerBuy();
+        assertEq(address(sink).balance, 5 ether, "a lister cannot price a gotchi at the sink's balance");
+        assertEq(nft.ownerOf(id), address(baazaar));
+
+        // Exactly the cap is fine.
+        mintAndList(seller, cap);
+        (ok,,,,,) = sink.canBuy();
+        assertTrue(ok);
+        sink.triggerBuy();
+        assertEq(address(sink).balance, 5 ether - cap);
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Successful buy
     // ---------------------------------------------------------------------------------------------

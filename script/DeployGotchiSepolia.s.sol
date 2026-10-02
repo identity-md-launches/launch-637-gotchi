@@ -13,16 +13,22 @@ import {MockBaazaar} from "../src/MockBaazaar.sol";
 import {FlipEscrow} from "../src/FlipEscrow.sol";
 import {HolderWeightedPicker} from "../src/HolderWeightedPicker.sol";
 import {ForeverLiquidity} from "../src/ForeverLiquidity.sol";
+import {GotchiStackDeployer} from "../src/GotchiStackDeployer.sol";
+import {PriceMath} from "../src/PriceMath.sol";
 
 /// @title DeployGotchiSepolia
-/// @notice Optional Sepolia deployment of the whole $GOTCHI stack: token, hook (CREATE2, address mined
-/// to carry its permission bits), mock NFT, mock Baazaar, picker, escrow, FeeSink and ForeverLiquidity,
-/// then pool initialization and the initial forever liquidity.
+/// @notice Optional Sepolia deployment of the whole $GOTCHI stack: token, mock NFT, mock Baazaar, picker,
+/// escrow, then (in one transaction through `GotchiStackDeployer`) the hook at a mined CREATE2 address,
+/// the FeeSink bound to it, ForeverLiquidity and the pool initialization, and finally the initial forever
+/// liquidity behind an exact-price guard.
 ///
-/// Usage (simulate first, then broadcast from a reviewed signer):
+/// Usage (simulate first, then broadcast from a reviewed signer, one transaction at a time):
 ///
 ///   forge script script/DeployGotchiSepolia.s.sol --rpc-url $SEPOLIA_RPC
-///   forge script script/DeployGotchiSepolia.s.sol --rpc-url $SEPOLIA_RPC --broadcast --verify
+///   forge script script/DeployGotchiSepolia.s.sol --rpc-url $SEPOLIA_RPC --broadcast --slow --verify
+///
+/// `--slow` waits for each receipt before sending the next transaction; a failed receipt stops the run
+/// instead of letting later transactions build on a broken step.
 ///
 /// Environment (all optional):
 ///   GOTCHI_OPERATOR        commit-reveal operator (default: the broadcaster)
@@ -36,7 +42,6 @@ import {ForeverLiquidity} from "../src/ForeverLiquidity.sol";
 contract DeployGotchiSepolia is Script {
     struct Config {
         address poolManager;
-        address create2Deployer;
         address operator;
         address minter;
         uint256 initialLiquidityEth;
@@ -45,6 +50,7 @@ contract DeployGotchiSepolia is Script {
 
     struct Deployment {
         LaunchToken token;
+        GotchiStackDeployer stackDeployer;
         GotchiFeeHook hook;
         bytes32 hookSalt;
         MockAavegotchi nft;
@@ -61,28 +67,24 @@ contract DeployGotchiSepolia is Script {
     /// @dev Uniswap v4 PoolManager on Sepolia (chainId 11155111).
     address public constant SEPOLIA_POOL_MANAGER = 0xE03A1074c86CFeDd5C142C4F04F1a1536e203543;
     uint256 public constant SEPOLIA_CHAIN_ID = 11155111;
-    /// @dev Deterministic deployment proxy (Arachnid), present on Sepolia and used by forge for `new{salt:}`.
-    address public constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
 
     /// @notice Default initial liquidity: 0.1 ETH against 10% of the supply (100,000,000 GOTCHI),
     /// i.e. 1,000,000,000 GOTCHI per ETH and an implied market cap of 1 ETH. Configurable.
     uint256 public constant DEFAULT_INITIAL_ETH = 0.1 ether;
     uint256 public constant DEFAULT_INITIAL_TOKENS = 100_000_000e18;
 
-    /// @dev `ForeverLiquidity.addLiquidity` refunds rounding dust to its caller; when the tests call
-    /// `deploy` directly that caller is this contract.
+    /// @dev `ForeverLiquidity.addLiquidityWithin` refunds rounding dust to its caller; when the tests
+    /// call `deploy` directly that caller is this contract.
     receive() external payable {}
 
     function run() external returns (Deployment memory deployment) {
         require(block.chainid == SEPOLIA_CHAIN_ID, "Sepolia only");
         require(SEPOLIA_POOL_MANAGER.code.length != 0, "PoolManager has no code");
-        require(CREATE2_DEPLOYER.code.length != 0, "CREATE2 deployer missing");
 
         vm.startBroadcast();
         (, address broadcaster,) = vm.readCallers();
         Config memory cfg = Config({
             poolManager: SEPOLIA_POOL_MANAGER,
-            create2Deployer: CREATE2_DEPLOYER,
             operator: vm.envOr("GOTCHI_OPERATOR", broadcaster),
             minter: vm.envOr("GOTCHI_MINTER", broadcaster),
             initialLiquidityEth: vm.envOr("GOTCHI_INITIAL_ETH", DEFAULT_INITIAL_ETH),
@@ -95,52 +97,49 @@ contract DeployGotchiSepolia is Script {
     }
 
     /// @notice Deploys and wires everything for `cfg`. Tests call this directly against a local
-    /// PoolManager with `cfg.create2Deployer == address(this script)`.
+    /// PoolManager.
     function deploy(Config memory cfg) public returns (Deployment memory d) {
         require(cfg.poolManager != address(0), "pool manager");
         require(cfg.operator != address(0) && cfg.minter != address(0), "roles");
 
         d.token = new LaunchToken();
-
-        // Hook: CREATE2 at an address carrying exactly 0xCC.
-        bytes memory creationCode = abi.encodePacked(type(GotchiFeeHook).creationCode, abi.encode(cfg.poolManager));
-        (address predicted, bytes32 salt) = HookMiner.find(
-            cfg.create2Deployer, GotchiFeeHookFlags.FLAGS, creationCode, _firstFreeSalt(cfg, creationCode)
-        );
-        d.hookSalt = salt;
-        d.hook = new GotchiFeeHook{salt: salt}(cfg.poolManager);
-        require(address(d.hook) == predicted, "hook address differs from the mined one");
-        require(d.hook.addressHasValidFlags(), "hook address lacks its flags");
-
         d.nft = new MockAavegotchi(cfg.minter);
         d.baazaar = new MockBaazaar(address(d.nft));
         d.picker = new HolderWeightedPicker(address(d.token), cfg.poolManager);
         d.escrow = new FlipEscrow(address(d.nft), address(d.baazaar), address(d.picker), cfg.operator);
-        d.sink = new FeeSink(address(d.hook), address(d.baazaar), address(d.escrow));
-        require(d.hook.feeSink() == address(d.sink), "sink binding was front-run; redeploy");
-        d.forever = new ForeverLiquidity(address(d.token), cfg.poolManager, address(d.hook));
+
+        // Hook + FeeSink + ForeverLiquidity + pool initialization, atomically. The hook's CREATE2 address
+        // depends on the fresh helper's address, so a salt mined against it is unused by construction.
+        d.stackDeployer = new GotchiStackDeployer(cfg.poolManager);
+        bytes memory creationCode = abi.encodePacked(type(GotchiFeeHook).creationCode, abi.encode(cfg.poolManager));
+        (address predicted, bytes32 salt) =
+            HookMiner.find(address(d.stackDeployer), GotchiFeeHookFlags.FLAGS, creationCode, 0);
+        d.hookSalt = salt;
+        d.sqrtPriceX96 = _sqrtPriceFor(cfg);
+        (d.hook, d.sink, d.forever) =
+            d.stackDeployer.deploy(salt, address(d.token), address(d.baazaar), address(d.escrow), d.sqrtPriceX96);
+        require(address(d.hook) == predicted, "hook address differs from the mined one");
+        require(d.hook.addressHasValidFlags(), "hook address lacks its flags");
+        require(d.hook.feeSink() == address(d.sink), "sink is not bound to the hook");
         d.key = d.forever.poolKey();
 
-        // Pool: price from the configured amounts, then the initial forever liquidity.
-        d.sqrtPriceX96 = d.forever.sqrtPriceX96ForAmounts(cfg.initialLiquidityEth, cfg.initialLiquidityTokens);
-        d.forever.initializePool(d.sqrtPriceX96);
+        // Initial forever liquidity, only at exactly the price just set.
         d.liquidity = d.forever.liquidityForAmounts(cfg.initialLiquidityEth, cfg.initialLiquidityTokens);
         d.token.approve(address(d.forever), cfg.initialLiquidityTokens);
-        d.forever.addLiquidity{value: cfg.initialLiquidityEth}(d.liquidity, cfg.initialLiquidityTokens);
+        d.forever.addLiquidityWithin{value: cfg.initialLiquidityEth}(
+            d.liquidity, cfg.initialLiquidityTokens, d.sqrtPriceX96, d.sqrtPriceX96
+        );
     }
 
-    /// @dev Skips salts whose predicted address already has code (a previous run of this script).
-    function _firstFreeSalt(Config memory cfg, bytes memory creationCode) private view returns (uint256 start) {
-        while (true) {
-            (address predicted, bytes32 salt) =
-                HookMiner.find(cfg.create2Deployer, GotchiFeeHookFlags.FLAGS, creationCode, start);
-            if (predicted.code.length == 0) return start;
-            start = uint256(salt) + 1;
-        }
+    /// @dev The opening price implied by the configured amounts, computed with the same library
+    /// `ForeverLiquidity.sqrtPriceX96ForAmounts` uses (that contract does not exist yet at this point).
+    function _sqrtPriceFor(Config memory cfg) private pure returns (uint160) {
+        return PriceMath.sqrtPriceX96ForAmounts(cfg.initialLiquidityEth, cfg.initialLiquidityTokens);
     }
 
     function _log(Deployment memory d) private pure {
         console2.log("LaunchToken (GOTCHI) :", address(d.token));
+        console2.log("GotchiStackDeployer  :", address(d.stackDeployer));
         console2.log("GotchiFeeHook        :", address(d.hook));
         console2.log("  hook CREATE2 salt  :", uint256(d.hookSalt));
         console2.log("MockAavegotchi       :", address(d.nft));

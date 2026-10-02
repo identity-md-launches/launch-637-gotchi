@@ -190,10 +190,62 @@ contract FlipEscrowTest is Test {
         _deliver(id2);
         assertEq(uint8(escrow.getAcquisition(1).status), uint8(FlipEscrow.Status.Requested));
         assertEq(escrow.getAcquisition(1).commitmentIndex, 0);
-        // The first one can never be bound: every commitment is at least as new as it is.
+        // A commitment made in the binding block is still too new for the pending one...
         _commit(keccak256("later"));
         vm.expectRevert(FlipEscrow.NoCommitmentAvailable.selector);
         escrow.requestFlip(0);
+        // ...but one block later anyone can bind it.
+        vm.roll(102);
+        bytes32 requestId = escrow.computeRequestId(0, id, 1, keccak256("later"));
+        vm.expectEmit(true, false, false, true, address(escrow));
+        emit FlipEscrow.FlipRequested(0, id, requestId);
+        escrow.requestFlip(0);
+        FlipEscrow.Acquisition memory a = escrow.getAcquisition(0);
+        assertEq(uint8(a.status), uint8(FlipEscrow.Status.Requested));
+        assertEq(a.commitmentIndex, 1);
+        assertEq(a.requestBlock, 102);
+        assertEq(a.receivedBlock, 100);
+        assertEq(escrow.availableCommitments(), 0);
+    }
+
+    function test_pendingAcquisitionBindsACommitmentMadeAfterItsReceipt() public {
+        // Empty queue at delivery; the operator commits afterwards; a keeper binds and the flip resolves.
+        _registerHolders();
+        uint256 id = _mintToBaazaar();
+        _deliver(id);
+        (bytes32 secret, bytes32 hash) = _findSecret(0, id, 0, false);
+        vm.roll(150);
+        _commit(hash);
+        vm.expectRevert(FlipEscrow.NoCommitmentAvailable.selector);
+        escrow.requestFlip(0); // same block as the commitment
+        vm.roll(151);
+        escrow.requestFlip(0);
+        FlipEscrow.Acquisition memory a = escrow.getAcquisition(0);
+        assertEq(uint8(a.status), uint8(FlipEscrow.Status.Requested));
+        assertEq(a.pickerVersion, picker.version(), "eligible set frozen at the request");
+
+        escrow.reveal(0, secret);
+        address owner = nft.ownerOf(id);
+        assertTrue(owner == alice || owner == bob, "a pending acquisition still gets its 50/50");
+        // Once bound it can no longer be expired as pending.
+        vm.roll(100 + escrow.PENDING_TIMEOUT_BLOCKS() + 1);
+        vm.expectRevert(abi.encodeWithSelector(FlipEscrow.InvalidStatus.selector, 0, FlipEscrow.Status.Resolved));
+        escrow.expire(0);
+    }
+
+    function test_requestFlipConsumesCommitmentsInOrderAcrossPendingAndNewAcquisitions() public {
+        uint256 id0 = _mintToBaazaar();
+        _deliver(id0); // pending, nothing queued
+        vm.roll(101);
+        _commit(keccak256("c0"));
+        _commit(keccak256("c1"));
+        vm.roll(102);
+        uint256 id1 = _mintToBaazaar();
+        _deliver(id1); // takes c0 immediately
+        assertEq(escrow.getAcquisition(1).commitmentIndex, 0);
+        escrow.requestFlip(0); // the older pending one takes c1
+        assertEq(escrow.getAcquisition(0).commitmentIndex, 1);
+        assertEq(escrow.availableCommitments(), 0);
     }
 
     function test_requestFlipBindsAPendingAcquisitionLater() public {
@@ -283,7 +335,26 @@ contract FlipEscrowTest is Test {
         assertEq(nft.ownerOf(id), DEAD);
     }
 
-    function test_airdropRollWithStaleWinnerBurns() public {
+    function test_airdropRollWithEveryDrawStaleBurns() public {
+        _registerHolders();
+        uint256 expectedId = nft.nextTokenId();
+        (bytes32 secret, bytes32 hash) = _findSecret(0, expectedId, 0, false);
+        _commit(hash);
+        vm.roll(101);
+        uint256 id = _mintToBaazaar();
+        _deliver(id);
+        // Both registered holders move one wei away without refreshing: every draw is stale.
+        vm.prank(alice);
+        token.transfer(address(0xBEEF), 1);
+        vm.prank(bob);
+        token.transfer(address(0xBEEF), 1);
+        vm.expectEmit(true, true, false, true, address(escrow));
+        emit FlipEscrow.FlipResolved(0, id, true, DEAD);
+        escrow.reveal(0, secret);
+        assertEq(nft.ownerOf(id), DEAD, "stale weights forfeit to a burn");
+    }
+
+    function test_airdropRollWithOneStaleHolderRedrawsToTheOther() public {
         _registerHolders();
         uint256 expectedId = nft.nextTokenId();
         (bytes32 secret, bytes32 hash) = _findSecret(0, expectedId, 0, false);
@@ -292,12 +363,120 @@ contract FlipEscrowTest is Test {
         uint256 id = _mintToBaazaar();
         _deliver(id);
         uint256 roll = escrow.rollFor(secret, escrow.getAcquisition(0).requestId);
-        (address winner,) = picker.pick(roll);
-        // The would-be winner moves one wei away without refreshing: their stored weight is stale.
-        vm.prank(winner);
+        (address firstDraw,) = picker.pick(roll);
+        address other = firstDraw == alice ? bob : alice;
+        // The first draw's holder moves one wei away without refreshing; the re-draws can only land on
+        // the other holder (or forfeit if every one of them hits the stale holder again).
+        vm.prank(firstDraw);
         token.transfer(address(0xBEEF), 1);
+        (address expected,) = picker.pickAt(escrow.getAcquisition(0).pickerVersion, roll);
+        assertTrue(expected == other || expected == address(0));
+        uint256 versionBefore = picker.version();
         escrow.reveal(0, secret);
-        assertEq(nft.ownerOf(id), DEAD, "stale weight forfeits to a burn");
+        assertEq(nft.ownerOf(id), expected == address(0) ? DEAD : expected, "re-drawn past the stale holder");
+        assertEq(picker.weightOf(firstDraw), token.balanceOf(firstDraw), "the stale entry was refreshed");
+        assertGt(picker.version(), versionBefore);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Reveal: the eligible set is frozen at the request
+    // ---------------------------------------------------------------------------------------------
+
+    function test_registrationAfterTheRequestCannotWinThatFlip() public {
+        _registerHolders();
+        uint256 expectedId = nft.nextTokenId();
+        (bytes32 secret, bytes32 hash) = _findSecret(0, expectedId, 0, false);
+        _commit(hash);
+        vm.roll(101);
+        uint256 id = _mintToBaazaar();
+        _deliver(id);
+        uint256 frozen = escrow.getAcquisition(0).pickerVersion;
+        assertEq(frozen, picker.version());
+
+        // The reveal is public: a late entrant funds exactly the weight that would catch the roll against
+        // the *current* registry and registers before the reveal lands.
+        uint256 roll = escrow.rollFor(secret, escrow.getAcquisition(0).requestId);
+        uint256 honest = picker.totalWeight();
+        address attacker = makeAddr("attacker");
+        uint256 w = 0;
+        for (uint256 candidate = 1e15; candidate <= honest; candidate += 1e15) {
+            if (roll % (honest + candidate) >= honest) {
+                w = candidate;
+                break;
+            }
+        }
+        assertGt(w, 0);
+        token.transfer(attacker, w);
+        vm.prank(attacker);
+        picker.register();
+        (address liveWinner,) = picker.pick(roll);
+        assertEq(liveWinner, attacker, "against the live registry the attacker would win");
+        (address frozenWinner, uint256 frozenWeight) = picker.pickAt(frozen, roll);
+        assertTrue(frozenWinner == alice || frozenWinner == bob);
+
+        vm.expectEmit(true, true, false, true, address(escrow));
+        emit FlipEscrow.Airdropped(id, frozenWinner, frozenWeight);
+        escrow.reveal(0, secret);
+        assertEq(nft.ownerOf(id), frozenWinner, "the frozen registry decides");
+    }
+
+    function test_refreshAfterTheRequestCannotChangeTheWinner() public {
+        _registerHolders();
+        uint256 expectedId = nft.nextTokenId();
+        (bytes32 secret, bytes32 hash) = _findSecret(0, expectedId, 0, false);
+        _commit(hash);
+        vm.roll(101);
+        uint256 id = _mintToBaazaar();
+        _deliver(id);
+        uint256 roll = escrow.rollFor(secret, escrow.getAcquisition(0).requestId);
+        (address frozenWinner,) = picker.pickAt(escrow.getAcquisition(0).pickerVersion, roll);
+        address loser = frozenWinner == alice ? bob : alice;
+        // The loser pumps their weight after the request: irrelevant to this flip.
+        token.transfer(loser, 1_000_000e18);
+        picker.refresh(loser);
+        escrow.reveal(0, secret);
+        assertEq(nft.ownerOf(id), frozenWinner);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Stray NFTs
+    // ---------------------------------------------------------------------------------------------
+
+    function test_strayNftPushedInWithTransferFromCanOnlyBeBurned() public {
+        vm.prank(minter);
+        uint256 id = nft.mint(alice);
+        vm.prank(alice);
+        nft.transferFrom(alice, address(escrow), id); // no callback: no acquisition
+        assertEq(escrow.acquisitionCount(), 0);
+        (bool found,) = escrow.latestAcquisitionOf(id);
+        assertFalse(found);
+        vm.expectEmit(true, false, false, true, address(escrow));
+        emit FlipEscrow.StraySwept(id);
+        vm.expectEmit(true, true, false, true, address(escrow));
+        emit FlipEscrow.Burned(id, DEAD);
+        escrow.sweepStray(id);
+        assertEq(nft.ownerOf(id), DEAD);
+    }
+
+    function test_sweepStrayRefusesOpenAcquisitionsAndTokensNotHeld() public {
+        uint256 id = _mintToBaazaar();
+        _deliver(id); // pending acquisition: not a stray
+        vm.expectRevert(abi.encodeWithSelector(FlipEscrow.NotStray.selector, id));
+        escrow.sweepStray(id);
+        vm.prank(minter);
+        uint256 other = nft.mint(alice);
+        vm.expectRevert(abi.encodeWithSelector(FlipEscrow.NotStray.selector, other));
+        escrow.sweepStray(other);
+        // Resolved and returned: a stray again.
+        vm.roll(100 + escrow.PENDING_TIMEOUT_BLOCKS() + 1);
+        escrow.expire(0);
+        (bool found, uint256 acquisitionId) = escrow.latestAcquisitionOf(id);
+        assertTrue(found);
+        assertEq(acquisitionId, 0);
+        vm.prank(DEAD);
+        nft.transferFrom(DEAD, address(escrow), id);
+        escrow.sweepStray(id);
+        assertEq(nft.ownerOf(id), DEAD);
     }
 
     // ---------------------------------------------------------------------------------------------

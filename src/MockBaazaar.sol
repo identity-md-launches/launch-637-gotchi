@@ -18,9 +18,11 @@ interface IBaazaarBuyer {
 /// Stands in for the Aavegotchi Baazaar on Sepolia; the real Baazaar is a README TODO.
 ///
 /// @dev Listings escrow the NFT in this contract. Sellers are paid with pull payments (`proceeds`,
-/// `withdrawProceeds`) so a seller that cannot receive ETH can never block a purchase. The number of
-/// simultaneously active listings is capped so that `cheapest()` stays affordable to scan.
-/// There is no admin role: sellers manage their own listings, nobody can delist or reprice others'.
+/// `withdrawProceeds`) so a seller that cannot receive ETH can never block a purchase. Active listings
+/// are kept in a separate index (`_activeIds`, swap-and-pop on cancel or sale) and `cheapest()` scans
+/// only that index, so its cost is bounded by `MAX_ACTIVE_LISTINGS` no matter how many listings were
+/// ever created or cancelled. There is no admin role: sellers manage their own listings, nobody can
+/// delist or reprice others'.
 contract MockBaazaar is ReentrancyGuard {
     struct Listing {
         address seller;
@@ -35,14 +37,17 @@ contract MockBaazaar is ReentrancyGuard {
     /// @notice The NFT collection sold here.
     IERC721 public immutable NFT;
 
-    /// @notice Number of listings that are currently active.
-    uint256 public activeCount;
-
     /// @notice ETH owed to sellers, claimable with `withdrawProceeds`.
     mapping(address seller => uint256 amount) public proceeds;
 
     // Index 0 is a sentinel so that listing id 0 means "none".
     Listing[] private _listings;
+    // Ids of the active listings, in no particular order; the only thing `cheapest()` reads.
+    uint256[] private _activeIds;
+    // 1-based slot of a listing id in `_activeIds` (0 = not active).
+    mapping(uint256 listingId => uint256 slotPlusOne) private _activeSlot;
+    // The buyer whose payment callback is running; the only sender `receive()` accepts.
+    address private _payingBuyer;
 
     /// @notice A listing was created. Kept for the UI: indexed listing id, token and price.
     event ListingMocked(uint256 indexed listingId, uint256 tokenId, uint256 price);
@@ -73,6 +78,7 @@ contract MockBaazaar is ReentrancyGuard {
     error RefundFailed();
     error NothingToWithdraw();
     error TransferFailed();
+    error UnexpectedEth(address sender);
 
     constructor(address nft) {
         if (nft == address(0)) revert ZeroAddress();
@@ -80,8 +86,11 @@ contract MockBaazaar is ReentrancyGuard {
         _listings.push();
     }
 
-    /// @notice Accepts the ETH an `IBaazaarBuyer` sends from `payForListing`.
-    receive() external payable {}
+    /// @notice Accepts ETH only from the `IBaazaarBuyer` whose `payForListing` callback is running, so
+    /// stray transfers (which no seller could ever claim) are refused.
+    receive() external payable {
+        if (msg.sender != _payingBuyer) revert UnexpectedEth(msg.sender);
+    }
 
     // ---------------------------------------------------------------------------------------------
     // Sellers
@@ -90,10 +99,11 @@ contract MockBaazaar is ReentrancyGuard {
     /// @notice Lists `tokenId` for `price` wei. The caller must own it and have approved this contract.
     function list(uint256 tokenId, uint256 price) external nonReentrant returns (uint256 listingId) {
         if (price < 1) revert ZeroPrice();
-        if (activeCount >= MAX_ACTIVE_LISTINGS) revert TooManyListings();
+        if (_activeIds.length >= MAX_ACTIVE_LISTINGS) revert TooManyListings();
         listingId = _listings.length;
         _listings.push(Listing({seller: msg.sender, tokenId: tokenId, price: price, active: true}));
-        activeCount += 1;
+        _activeIds.push(listingId);
+        _activeSlot[listingId] = _activeIds.length;
         emit ListingMocked(listingId, tokenId, price);
         NFT.transferFrom(msg.sender, address(this), tokenId);
     }
@@ -103,8 +113,7 @@ contract MockBaazaar is ReentrancyGuard {
         Listing storage listing = _get(listingId);
         if (listing.seller != msg.sender) revert NotSeller();
         if (!listing.active) revert ListingNotActive(listingId);
-        listing.active = false;
-        activeCount -= 1;
+        _deactivate(listingId, listing);
         emit ListingCancelled(listingId, listing.tokenId);
         NFT.transferFrom(address(this), msg.sender, listing.tokenId);
     }
@@ -144,8 +153,7 @@ contract MockBaazaar is ReentrancyGuard {
         if (price > maxPrice) revert PriceAboveMax(price, maxPrice);
 
         Listing storage listing = _listings[listingId];
-        listing.active = false;
-        activeCount -= 1;
+        _deactivate(listingId, listing);
         proceeds[seller] += price;
         emit Sold(listingId, tokenId, price, seller, msg.sender, recipient);
 
@@ -159,7 +167,9 @@ contract MockBaazaar is ReentrancyGuard {
             }
         } else {
             uint256 balanceBefore = address(this).balance;
+            _payingBuyer = msg.sender;
             IBaazaarBuyer(msg.sender).payForListing(listingId, price);
+            _payingBuyer = address(0);
             if (address(this).balance < balanceBefore + price) revert Unpaid();
             NFT.safeTransferFrom(address(this), recipient, tokenId);
         }
@@ -170,23 +180,34 @@ contract MockBaazaar is ReentrancyGuard {
     // ---------------------------------------------------------------------------------------------
 
     /// @notice The cheapest active listing, if any (ties resolved towards the lowest listing id).
+    /// @dev Scans only the active index: at most `MAX_ACTIVE_LISTINGS` storage reads.
     function cheapest()
         public
         view
         returns (bool found, uint256 listingId, uint256 tokenId, uint256 price, address seller)
     {
-        uint256 length = _listings.length;
-        for (uint256 i = 1; i < length; i++) {
-            Listing storage listing = _listings[i];
-            if (!listing.active) continue;
-            if (!found || listing.price < price) {
+        uint256 length = _activeIds.length;
+        for (uint256 i = 0; i < length; i++) {
+            uint256 id = _activeIds[i];
+            Listing storage listing = _listings[id];
+            if (!found || listing.price < price || (listing.price == price && id < listingId)) {
                 found = true;
-                listingId = i;
+                listingId = id;
                 tokenId = listing.tokenId;
                 price = listing.price;
                 seller = listing.seller;
             }
         }
+    }
+
+    /// @notice Number of listings that are currently active.
+    function activeCount() external view returns (uint256) {
+        return _activeIds.length;
+    }
+
+    /// @notice The active listing id stored at `index` of the active index (unordered).
+    function activeListingIdAt(uint256 index) external view returns (uint256) {
+        return _activeIds[index];
     }
 
     /// @notice Number of listings ever created (active or not). Ids run from 1 to this value.
@@ -197,6 +218,24 @@ contract MockBaazaar is ReentrancyGuard {
     /// @notice A listing by id.
     function getListing(uint256 listingId) external view returns (Listing memory) {
         return _get(listingId);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Internals
+    // ---------------------------------------------------------------------------------------------
+
+    /// @dev Marks a listing inactive and removes it from the active index with a swap-and-pop.
+    function _deactivate(uint256 listingId, Listing storage listing) private {
+        listing.active = false;
+        uint256 slot = _activeSlot[listingId];
+        uint256 lastIndex = _activeIds.length - 1;
+        uint256 lastId = _activeIds[lastIndex];
+        if (slot - 1 != lastIndex) {
+            _activeIds[slot - 1] = lastId;
+            _activeSlot[lastId] = slot;
+        }
+        _activeIds.pop();
+        _activeSlot[listingId] = 0;
     }
 
     function _get(uint256 listingId) private view returns (Listing storage) {

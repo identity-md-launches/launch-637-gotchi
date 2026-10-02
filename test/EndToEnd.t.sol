@@ -108,9 +108,9 @@ contract EndToEndTest is GotchiFixture {
         escrow.reveal(0, secretBurn);
         assertEq(nft.ownerOf(cheapId), DEAD);
 
-        // Flip 1 airdrops to the weighted pick.
+        // Flip 1 airdrops to the weighted pick, taken against the registry frozen at the request.
         uint256 roll = escrow.rollFor(secretDrop, escrow.getAcquisition(1).requestId);
-        (address winner, uint256 weight) = picker.pick(roll);
+        (address winner, uint256 weight) = picker.pickAt(escrow.getAcquisition(1).pickerVersion, roll);
         assertTrue(winner == alice || winner == bob || winner == carol);
         assertEq(weight, token.balanceOf(winner));
         vm.expectEmit(true, true, false, true, address(escrow));
@@ -161,5 +161,26 @@ contract EndToEndTest is GotchiFixture {
         vm.roll(block.number + escrow.PENDING_TIMEOUT_BLOCKS() + 1);
         escrow.expire(acquisitionId);
         assertEq(nft.ownerOf(tokenId), DEAD);
+    }
+
+    function test_buyWithoutAnyCommitmentIsFlippedOnceTheOperatorCommits() public {
+        fundAndRegister(alice, 1_000e18);
+        mintAndList(seller, 0.004 ether);
+        swap(key, true, -4 ether);
+        uint256 acquisitionId = sink.triggerBuy();
+        uint256 tokenId = escrow.getAcquisition(acquisitionId).tokenId;
+        assertEq(uint8(escrow.getAcquisition(acquisitionId).status), uint8(FlipEscrow.Status.Pending));
+
+        // The operator catches up a few blocks later; a keeper binds the pending acquisition.
+        (bytes32 secret, bytes32 hash) = findSecret(acquisitionId, tokenId, 0, false);
+        vm.roll(block.number + 5);
+        vm.prank(operator);
+        escrow.commit(hash);
+        vm.roll(block.number + 1);
+        vm.expectEmit(true, false, false, true, address(escrow));
+        emit FlipEscrow.FlipRequested(acquisitionId, tokenId, escrow.computeRequestId(acquisitionId, tokenId, 0, hash));
+        escrow.requestFlip(acquisitionId);
+        escrow.reveal(acquisitionId, secret);
+        assertEq(nft.ownerOf(tokenId), alice, "the only registered holder receives the airdrop");
     }
 }
