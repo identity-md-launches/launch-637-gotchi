@@ -1,0 +1,395 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.26;
+
+import {Test} from "forge-std/Test.sol";
+import {LaunchToken} from "../src/LaunchToken.sol";
+import {MockAavegotchi} from "../src/MockAavegotchi.sol";
+import {HolderWeightedPicker} from "../src/HolderWeightedPicker.sol";
+import {FlipEscrow} from "../src/FlipEscrow.sol";
+
+/// @notice Unit tests for the escrow in isolation: a plain address plays the Baazaar.
+contract FlipEscrowTest is Test {
+    address constant DEAD = 0x000000000000000000000000000000000000dEaD;
+
+    LaunchToken token;
+    MockAavegotchi nft;
+    HolderWeightedPicker picker;
+    FlipEscrow escrow;
+
+    address operator = makeAddr("operator");
+    address minter = makeAddr("minter");
+    address baazaar = makeAddr("baazaar");
+    address poolManager = makeAddr("poolManager");
+    address alice = makeAddr("alice");
+    address bob = makeAddr("bob");
+
+    function setUp() public {
+        token = new LaunchToken();
+        nft = new MockAavegotchi(minter);
+        picker = new HolderWeightedPicker(address(token), poolManager);
+        escrow = new FlipEscrow(address(nft), baazaar, address(picker), operator);
+        vm.roll(100);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------------------------------
+
+    function _mintToBaazaar() internal returns (uint256 tokenId) {
+        vm.prank(minter);
+        tokenId = nft.mint(baazaar);
+    }
+
+    function _deliver(uint256 tokenId) internal {
+        vm.prank(baazaar);
+        nft.safeTransferFrom(baazaar, address(escrow), tokenId);
+    }
+
+    function _commit(bytes32 hash) internal {
+        vm.prank(operator);
+        escrow.commit(hash);
+    }
+
+    function _findSecret(uint256 acquisitionId, uint256 tokenId, uint256 commitmentIndex, bool wantBurn)
+        internal
+        view
+        returns (bytes32 secret, bytes32 hash)
+    {
+        for (uint256 i = 1; i < 10_000; i++) {
+            secret = keccak256(abi.encode("secret", i));
+            hash = keccak256(abi.encodePacked(secret));
+            bytes32 requestId = escrow.computeRequestId(acquisitionId, tokenId, commitmentIndex, hash);
+            if (escrow.isBurnRoll(escrow.rollFor(secret, requestId)) == wantBurn) return (secret, hash);
+        }
+        revert("no secret");
+    }
+
+    function _registerHolders() internal {
+        token.transfer(alice, 25e18);
+        token.transfer(bob, 75e18);
+        vm.prank(alice);
+        picker.register();
+        vm.prank(bob);
+        picker.register();
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Construction and roles
+    // ---------------------------------------------------------------------------------------------
+
+    function test_constantsAndWiring() public view {
+        assertEq(escrow.FLIP_BURN_BPS(), 5_000);
+        assertEq(escrow.BURN_ADDRESS(), DEAD);
+        assertEq(address(escrow.NFT()), address(nft));
+        assertEq(escrow.BAAZAAR(), baazaar);
+        assertEq(address(escrow.PICKER()), address(picker));
+        assertEq(escrow.OPERATOR(), operator);
+        assertEq(escrow.acquisitionCount(), 0);
+        assertEq(escrow.commitmentCount(), 0);
+    }
+
+    function test_constructorRejectsZeroAddresses() public {
+        vm.expectRevert(FlipEscrow.ZeroAddress.selector);
+        new FlipEscrow(address(0), baazaar, address(picker), operator);
+        vm.expectRevert(FlipEscrow.ZeroAddress.selector);
+        new FlipEscrow(address(nft), address(0), address(picker), operator);
+        vm.expectRevert(FlipEscrow.ZeroAddress.selector);
+        new FlipEscrow(address(nft), baazaar, address(0), operator);
+        vm.expectRevert(FlipEscrow.ZeroAddress.selector);
+        new FlipEscrow(address(nft), baazaar, address(picker), address(0));
+    }
+
+    function test_onlyOperatorCommits() public {
+        vm.expectRevert(FlipEscrow.NotOperator.selector);
+        escrow.commit(bytes32(uint256(1)));
+        vm.prank(operator);
+        vm.expectRevert(FlipEscrow.ZeroCommitment.selector);
+        escrow.commit(bytes32(0));
+
+        vm.prank(operator);
+        vm.expectEmit(true, false, false, true, address(escrow));
+        emit FlipEscrow.RandomnessCommitted(0, bytes32(uint256(1)));
+        escrow.commit(bytes32(uint256(1)));
+        bytes32[] memory more = new bytes32[](2);
+        more[0] = bytes32(uint256(2));
+        more[1] = bytes32(uint256(3));
+        vm.prank(operator);
+        escrow.commitMany(more);
+        assertEq(escrow.commitmentCount(), 3);
+        assertEq(escrow.availableCommitments(), 3);
+        FlipEscrow.Commitment memory c = escrow.getCommitment(2);
+        assertEq(c.hash, bytes32(uint256(3)));
+        assertEq(c.commitBlock, 100);
+        assertFalse(c.bound);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Intake
+    // ---------------------------------------------------------------------------------------------
+
+    function test_onlyTheNftContractMayDeliver() public {
+        vm.expectRevert(FlipEscrow.NotTheNft.selector);
+        escrow.onERC721Received(address(this), baazaar, 1, "");
+    }
+
+    function test_onlyTransfersFromTheBaazaarAreAccepted() public {
+        vm.prank(minter);
+        uint256 id = nft.mint(alice);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(FlipEscrow.NotFromBaazaar.selector, alice));
+        nft.safeTransferFrom(alice, address(escrow), id);
+        assertEq(escrow.acquisitionCount(), 0);
+    }
+
+    function test_deliveryWithoutCommitmentStaysPending() public {
+        uint256 id = _mintToBaazaar();
+        vm.expectEmit(true, false, false, true, address(escrow));
+        emit FlipEscrow.AcquisitionReceived(0, id);
+        _deliver(id);
+        FlipEscrow.Acquisition memory a = escrow.getAcquisition(0);
+        assertEq(uint8(a.status), uint8(FlipEscrow.Status.Pending));
+        assertEq(a.tokenId, id);
+        assertEq(a.receivedBlock, 100);
+        assertEq(nft.ownerOf(id), address(escrow));
+        vm.expectRevert(FlipEscrow.NoCommitmentAvailable.selector);
+        escrow.requestFlip(0);
+    }
+
+    function test_deliveryBindsAnEarlierCommitment() public {
+        bytes32 hash = keccak256("x");
+        _commit(hash);
+        vm.roll(101);
+        uint256 id = _mintToBaazaar();
+        bytes32 requestId = escrow.computeRequestId(0, id, 0, hash);
+        vm.expectEmit(true, false, false, true, address(escrow));
+        emit FlipEscrow.FlipRequested(0, id, requestId);
+        _deliver(id);
+
+        FlipEscrow.Acquisition memory a = escrow.getAcquisition(0);
+        assertEq(uint8(a.status), uint8(FlipEscrow.Status.Requested));
+        assertEq(a.commitmentIndex, 0);
+        assertEq(a.requestBlock, 101);
+        assertEq(a.requestId, requestId);
+        FlipEscrow.Commitment memory c = escrow.getCommitment(0);
+        assertTrue(c.bound);
+        assertEq(c.acquisitionId, 0);
+        assertEq(escrow.nextCommitment(), 1);
+        assertEq(escrow.availableCommitments(), 0);
+        vm.expectRevert(abi.encodeWithSelector(FlipEscrow.InvalidStatus.selector, 0, FlipEscrow.Status.Requested));
+        escrow.requestFlip(0);
+    }
+
+    function test_sameBlockCommitmentIsNotEligibleForThatDelivery() public {
+        _commit(keccak256("same block"));
+        uint256 id = _mintToBaazaar();
+        _deliver(id);
+        assertEq(uint8(escrow.getAcquisition(0).status), uint8(FlipEscrow.Status.Pending));
+        // ...but it serves the next delivery, which happens later.
+        vm.roll(101);
+        uint256 id2 = _mintToBaazaar();
+        _deliver(id2);
+        assertEq(uint8(escrow.getAcquisition(1).status), uint8(FlipEscrow.Status.Requested));
+        assertEq(escrow.getAcquisition(1).commitmentIndex, 0);
+        // The first one can never be bound: every commitment is at least as new as it is.
+        _commit(keccak256("later"));
+        vm.expectRevert(FlipEscrow.NoCommitmentAvailable.selector);
+        escrow.requestFlip(0);
+    }
+
+    function test_requestFlipBindsAPendingAcquisitionLater() public {
+        // Two commitments queued, two deliveries in the same later block consume them in order.
+        _commit(keccak256("a"));
+        _commit(keccak256("b"));
+        vm.roll(105);
+        uint256 id1 = _mintToBaazaar();
+        uint256 id2 = _mintToBaazaar();
+        _deliver(id1);
+        _deliver(id2);
+        assertEq(escrow.getAcquisition(0).commitmentIndex, 0);
+        assertEq(escrow.getAcquisition(1).commitmentIndex, 1);
+        assertEq(escrow.availableCommitments(), 0);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Reveal: burn path
+    // ---------------------------------------------------------------------------------------------
+
+    function test_revealBurnsOnABurnRoll() public {
+        uint256 expectedId = nft.nextTokenId();
+        (bytes32 secret, bytes32 hash) = _findSecret(0, expectedId, 0, true);
+        _commit(hash);
+        vm.roll(101);
+        uint256 id = _mintToBaazaar();
+        assertEq(id, expectedId);
+        _deliver(id);
+        _registerHolders();
+
+        bytes32 requestId = escrow.getAcquisition(0).requestId;
+        uint256 roll = escrow.rollFor(secret, requestId);
+        vm.expectEmit(true, false, false, true, address(escrow));
+        emit FlipEscrow.FlipRevealed(0, roll);
+        vm.expectEmit(true, true, false, true, address(escrow));
+        emit FlipEscrow.FlipResolved(0, id, true, DEAD);
+        vm.expectEmit(true, true, false, true, address(escrow));
+        emit FlipEscrow.Burned(id, DEAD);
+        escrow.reveal(0, secret);
+
+        assertEq(nft.ownerOf(id), DEAD);
+        FlipEscrow.Acquisition memory a = escrow.getAcquisition(0);
+        assertEq(uint8(a.status), uint8(FlipEscrow.Status.Resolved));
+        assertTrue(a.burned);
+        assertEq(a.recipient, DEAD);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Reveal: airdrop path
+    // ---------------------------------------------------------------------------------------------
+
+    function test_revealAirdropsToTheWeightedPick() public {
+        _registerHolders();
+        uint256 expectedId = nft.nextTokenId();
+        (bytes32 secret, bytes32 hash) = _findSecret(0, expectedId, 0, false);
+        _commit(hash);
+        vm.roll(101);
+        uint256 id = _mintToBaazaar();
+        _deliver(id);
+
+        uint256 roll = escrow.rollFor(secret, escrow.getAcquisition(0).requestId);
+        (address expectedWinner, uint256 expectedWeight) = picker.pick(roll);
+        assertTrue(expectedWinner == alice || expectedWinner == bob);
+
+        vm.expectEmit(true, true, false, true, address(escrow));
+        emit FlipEscrow.FlipResolved(0, id, false, expectedWinner);
+        vm.expectEmit(true, true, false, true, address(escrow));
+        emit FlipEscrow.Airdropped(id, expectedWinner, expectedWeight);
+        escrow.reveal(0, secret);
+
+        assertEq(nft.ownerOf(id), expectedWinner);
+        FlipEscrow.Acquisition memory a = escrow.getAcquisition(0);
+        assertFalse(a.burned);
+        assertEq(a.recipient, expectedWinner);
+    }
+
+    function test_airdropRollWithoutEligibleHoldersBurns() public {
+        uint256 expectedId = nft.nextTokenId();
+        (bytes32 secret, bytes32 hash) = _findSecret(0, expectedId, 0, false);
+        _commit(hash);
+        vm.roll(101);
+        uint256 id = _mintToBaazaar();
+        _deliver(id);
+        vm.expectEmit(true, true, false, true, address(escrow));
+        emit FlipEscrow.FlipResolved(0, id, true, DEAD);
+        escrow.reveal(0, secret);
+        assertEq(nft.ownerOf(id), DEAD);
+    }
+
+    function test_airdropRollWithStaleWinnerBurns() public {
+        _registerHolders();
+        uint256 expectedId = nft.nextTokenId();
+        (bytes32 secret, bytes32 hash) = _findSecret(0, expectedId, 0, false);
+        _commit(hash);
+        vm.roll(101);
+        uint256 id = _mintToBaazaar();
+        _deliver(id);
+        uint256 roll = escrow.rollFor(secret, escrow.getAcquisition(0).requestId);
+        (address winner,) = picker.pick(roll);
+        // The would-be winner moves one wei away without refreshing: their stored weight is stale.
+        vm.prank(winner);
+        token.transfer(address(0xBEEF), 1);
+        escrow.reveal(0, secret);
+        assertEq(nft.ownerOf(id), DEAD, "stale weight forfeits to a burn");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Reveal: failure paths
+    // ---------------------------------------------------------------------------------------------
+
+    function test_revealRejectsWrongSecretAndWrongStatus() public {
+        (bytes32 secret, bytes32 hash) = _findSecret(0, 1, 0, true);
+        _commit(hash);
+        vm.roll(101);
+        uint256 id = _mintToBaazaar();
+        _deliver(id);
+        vm.expectRevert(FlipEscrow.BadSecret.selector);
+        escrow.reveal(0, keccak256("wrong"));
+        vm.expectRevert(abi.encodeWithSelector(FlipEscrow.UnknownAcquisition.selector, 5));
+        escrow.reveal(5, secret);
+        escrow.reveal(0, secret);
+        vm.expectRevert(abi.encodeWithSelector(FlipEscrow.InvalidStatus.selector, 0, FlipEscrow.Status.Resolved));
+        escrow.reveal(0, secret);
+        vm.expectRevert(abi.encodeWithSelector(FlipEscrow.InvalidStatus.selector, 0, FlipEscrow.Status.Resolved));
+        escrow.expire(0);
+    }
+
+    function test_revealOfAPendingAcquisitionIsRefused() public {
+        uint256 id = _mintToBaazaar();
+        _deliver(id);
+        vm.expectRevert(abi.encodeWithSelector(FlipEscrow.InvalidStatus.selector, 0, FlipEscrow.Status.Pending));
+        escrow.reveal(0, keccak256("whatever"));
+    }
+
+    function test_withheldRevealIsForceBurnedAfterTheWindow() public {
+        (bytes32 secret, bytes32 hash) = _findSecret(0, 1, 0, false);
+        _registerHolders();
+        _commit(hash);
+        vm.roll(101);
+        uint256 id = _mintToBaazaar();
+        _deliver(id);
+
+        vm.expectRevert(abi.encodeWithSelector(FlipEscrow.NotExpired.selector, 0));
+        escrow.expire(0);
+        vm.roll(101 + escrow.REVEAL_WINDOW_BLOCKS());
+        vm.expectRevert(abi.encodeWithSelector(FlipEscrow.NotExpired.selector, 0));
+        escrow.expire(0);
+        // Still revealable on the last block of the window.
+        vm.roll(101 + escrow.REVEAL_WINDOW_BLOCKS() + 1);
+        vm.expectRevert(abi.encodeWithSelector(FlipEscrow.RevealWindowClosed.selector, 0));
+        escrow.reveal(0, secret);
+
+        vm.expectEmit(true, false, false, true, address(escrow));
+        emit FlipEscrow.FlipExpired(0);
+        vm.expectEmit(true, true, false, true, address(escrow));
+        emit FlipEscrow.FlipResolved(0, id, true, DEAD);
+        vm.expectEmit(true, true, false, true, address(escrow));
+        emit FlipEscrow.Burned(id, DEAD);
+        escrow.expire(0);
+        assertEq(nft.ownerOf(id), DEAD, "forced burn, even though the roll would have airdropped");
+    }
+
+    function test_pendingAcquisitionIsForceBurnedAfterTheTimeout() public {
+        uint256 id = _mintToBaazaar();
+        _deliver(id);
+        vm.roll(100 + escrow.PENDING_TIMEOUT_BLOCKS());
+        vm.expectRevert(abi.encodeWithSelector(FlipEscrow.NotExpired.selector, 0));
+        escrow.expire(0);
+        vm.roll(100 + escrow.PENDING_TIMEOUT_BLOCKS() + 1);
+        escrow.expire(0);
+        assertEq(nft.ownerOf(id), DEAD);
+        assertEq(uint8(escrow.getAcquisition(0).status), uint8(FlipEscrow.Status.Resolved));
+    }
+
+    function test_rollMathIsFiftyFifty() public view {
+        assertTrue(escrow.isBurnRoll(0));
+        assertTrue(escrow.isBurnRoll(4_999));
+        assertFalse(escrow.isBurnRoll(5_000));
+        assertFalse(escrow.isBurnRoll(9_999));
+        assertTrue(escrow.isBurnRoll(10_000));
+        bytes32 requestId = keccak256("r");
+        assertEq(
+            escrow.rollFor(bytes32(uint256(1)), requestId),
+            uint256(keccak256(abi.encode(bytes32(uint256(1)), requestId)))
+        );
+    }
+
+    function test_requestIdBindsChainContractAcquisitionTokenAndCommitment() public view {
+        bytes32 base = escrow.computeRequestId(0, 1, 0, keccak256("h"));
+        assertEq(
+            base,
+            keccak256(abi.encode(address(escrow), block.chainid, uint256(0), uint256(1), uint256(0), keccak256("h")))
+        );
+        assertTrue(base != escrow.computeRequestId(1, 1, 0, keccak256("h")));
+        assertTrue(base != escrow.computeRequestId(0, 2, 0, keccak256("h")));
+        assertTrue(base != escrow.computeRequestId(0, 1, 1, keccak256("h")));
+        assertTrue(base != escrow.computeRequestId(0, 1, 0, keccak256("other")));
+    }
+}
