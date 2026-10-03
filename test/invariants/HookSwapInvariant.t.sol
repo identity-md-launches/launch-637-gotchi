@@ -84,38 +84,60 @@ contract HookSwapHandler is Test {
     // Swaps
     // ---------------------------------------------------------------------------------------------
 
-    /// @dev ETH in, exact input. The hooked pool swaps `amount - fee` internally, so the plain pool is
-    /// asked for exactly that. A tight limit (when `limitBps > 0`) truncates both fills identically.
+    /// @dev ETH in, exact input. The hook sizes the fee on the ETH the swap can fill (the whole input, or
+    /// what the price limit lets through) and the hooked pool swaps `amount - fee` internally, so the plain
+    /// pool is asked for exactly that. A tight limit (when `limitBps > 0`) truncates both fills identically.
     function swapExactInEth(uint256 amount, uint256 limitBps) external {
         amount = bound(amount, 1e9, 2 ether);
-        uint256 fee = amount * FEE_BPS / BPS;
         uint160 limit = _lowerLimit(bound(limitBps, 0, 300));
+        uint256 fee = _quotedFee(true, -int256(amount), limit);
         uint256 sinkBefore = address(sink).balance;
         int256 managerBefore = int256(address(manager).balance);
 
         BalanceDelta p = _swap(plainKey, true, -int256(amount - fee), limit, amount);
         BalanceDelta h = _swap(key, true, -int256(amount), limit, amount);
 
+        uint256 poolIntake = uint256(-int256(p.amount0()));
         _check(h.amount1() == p.amount1(), "exact-in ETH: token output differs from plain pool at amount - fee");
         _check(h.amount0() == p.amount0() - int256(fee), "exact-in ETH: trader pays plain cost plus the fee");
-        _check(address(sink).balance == sinkBefore + fee, "exact-in ETH: sink did not get 30 bps of the input");
-        if (uint256(-int256(p.amount0())) < amount - fee) ghostPartialFills += 1;
+        _check(address(sink).balance == sinkBefore + fee, "exact-in ETH: sink did not get the quoted fee");
+        _check(fee <= amount * FEE_BPS / BPS, "exact-in ETH: fee above 30 bps of the input");
+        if (poolIntake < amount - fee) {
+            // Truncated by the limit: the fee is 30 bps of what actually went into the pool.
+            _check(fee == poolIntake * FEE_BPS / BPS, "exact-in ETH: partial fill not charged 30 bps of the fill");
+            ghostPartialFills += 1;
+        } else {
+            _check(fee == amount * FEE_BPS / BPS, "exact-in ETH: full fill not charged 30 bps of the input");
+        }
         _account(fee, managerBefore);
     }
 
-    /// @dev ETH out, exact output. The hooked pool buys `amount + fee` and keeps the fee.
-    function swapExactOutEth(uint256 amount) external {
+    /// @dev ETH out, exact output. The hooked pool buys `amount + fee` and keeps the fee; a tight limit
+    /// truncates the output, in which case the fee is sized on the ETH that could be filled and the trader
+    /// still never pays ETH.
+    function swapExactOutEth(uint256 amount, uint256 limitBps) external {
         amount = bound(amount, 1e9, 1 ether);
-        uint256 fee = amount * FEE_BPS / BPS;
+        uint160 limit = _upperLimit(bound(limitBps, 0, 300));
+        uint256 fee = _quotedFee(false, int256(amount), limit);
         uint256 sinkBefore = address(sink).balance;
         int256 managerBefore = int256(address(manager).balance);
 
-        BalanceDelta p = _swap(plainKey, false, int256(amount + fee), TickMath.MAX_SQRT_PRICE - 1, 0);
-        BalanceDelta h = _swap(key, false, int256(amount), TickMath.MAX_SQRT_PRICE - 1, 0);
+        BalanceDelta p = _swap(plainKey, false, int256(amount + fee), limit, 0);
+        BalanceDelta h = _swap(key, false, int256(amount), limit, 0);
 
-        _check(h.amount0() == int256(amount), "exact-out ETH: trader did not receive the specified ETH");
+        uint256 poolOutput = uint256(int256(p.amount0()));
+        _check(h.amount0() >= 0, "exact-out ETH: the buyer ended up paying ETH");
+        _check(h.amount0() == p.amount0() - int256(fee), "exact-out ETH: trader does not net the pool output minus fee");
         _check(h.amount1() == p.amount1(), "exact-out ETH: token cost differs from plain pool at amount + fee");
-        _check(address(sink).balance == sinkBefore + fee, "exact-out ETH: sink did not get 30 bps of the output");
+        _check(address(sink).balance == sinkBefore + fee, "exact-out ETH: sink did not get the quoted fee");
+        _check(fee <= amount * FEE_BPS / BPS, "exact-out ETH: fee above 30 bps of the request");
+        if (poolOutput < amount + fee) {
+            _check(fee == poolOutput * FEE_BPS / BPS, "exact-out ETH: partial fill not charged 30 bps of the fill");
+            ghostPartialFills += 1;
+        } else {
+            _check(h.amount0() == int256(amount), "exact-out ETH: trader did not receive the specified ETH");
+            _check(fee == amount * FEE_BPS / BPS, "exact-out ETH: full fill not charged 30 bps of the output");
+        }
         _account(fee, managerBefore);
     }
 
@@ -197,6 +219,14 @@ contract HookSwapHandler is Test {
             SwapParams({zeroForOne: zeroForOne, amountSpecified: amountSpecified, sqrtPriceLimitX96: limit}),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
+        );
+    }
+
+    /// @dev The fee the hook will size in `beforeSwap` for an ETH-specified swap, read before any swap so
+    /// both pools are still at the same price.
+    function _quotedFee(bool zeroForOne, int256 amountSpecified, uint160 limit) private view returns (uint256) {
+        return hook.specifiedFeeFor(
+            key, SwapParams({zeroForOne: zeroForOne, amountSpecified: amountSpecified, sqrtPriceLimitX96: limit})
         );
     }
 

@@ -43,12 +43,16 @@ contract MarketHandler is Test {
     uint256 public ghostBuys;
     uint256 public ghostEscrowDeliveries;
     uint256 public ghostOutstandingProceeds;
-    uint256 public ghostStray;
     uint256 public ghostRequestFlipSuccesses;
     uint256 public ghostResolvedCount;
+    uint256 public ghostCapRefusals;
+    /// @dev NFTs pushed into the escrow with a plain `transferFrom` and not yet swept.
+    uint256 public ghostStraysInEscrow;
+    uint256 public ghostStraysSwept;
     mapping(uint256 acquisitionId => bool) public ghostResolved;
     mapping(uint256 acquisitionId => bool) public ghostBurned;
     mapping(uint256 acquisitionId => address) public ghostRecipient;
+    mapping(uint256 tokenId => bool) public ghostIsStrayInEscrow;
 
     string[] public violations;
     mapping(bytes32 selector => uint256) public calls;
@@ -115,12 +119,15 @@ contract MarketHandler is Test {
         ghostFunded += amount;
     }
 
+    /// @dev ETH nobody could ever claim must be refused outright, so the Baazaar's balance stays exactly
+    /// what sellers are owed.
     function strayEthToBaazaar(uint256 amount) external count("strayEthToBaazaar") {
         amount = bound(amount, 1, 0.001 ether);
         vm.deal(address(this), amount);
+        uint256 before = address(baazaar).balance;
         (bool ok,) = address(baazaar).call{value: amount}("");
-        _check(ok, "baazaar refused stray ETH");
-        ghostStray += amount;
+        _check(!ok, "baazaar accepted stray ETH outside a purchase callback");
+        _check(address(baazaar).balance == before, "refused ETH still changed the balance");
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -144,6 +151,19 @@ contract MarketHandler is Test {
             _check(full, "list reverted below the cap");
             _check(nft.ownerOf(id) == s, "failed listing moved the NFT");
         }
+        vm.stopPrank();
+    }
+
+    /// @dev A listing priced above the sink's cap: the crank must leave it alone however rich the sink is.
+    function listAboveCap(uint256 sellerSeed, uint256 price) external count("listAboveCap") {
+        address s = sellers[sellerSeed % sellers.length];
+        price = bound(price, sink.MAX_BUY_PRICE() + 1, 1 ether);
+        if (baazaar.activeCount() >= baazaar.MAX_ACTIVE_LISTINGS()) return;
+        uint256 id = nft.mint(s);
+        tokenIds.push(id);
+        vm.startPrank(s);
+        nft.approve(address(baazaar), id);
+        baazaar.list(id, price);
         vm.stopPrank();
     }
 
@@ -218,12 +238,19 @@ contract MarketHandler is Test {
     // ---------------------------------------------------------------------------------------------
 
     function triggerBuy() external count("triggerBuy") {
-        (bool ok,,, uint256 tokenId, uint256 price, address s) = sink.canBuy();
+        (bool ok, string memory reason,, uint256 tokenId, uint256 price, address s) = sink.canBuy();
         uint256 balanceBefore = address(sink).balance;
         uint256 acquisitionsBefore = escrow.acquisitionCount();
         uint256 owedBefore = s == address(0) ? 0 : baazaar.proceeds(s);
+        // The handler's own reading of the rules, independent of `canBuy`.
+        (bool listed,,, uint256 cheapestPrice,) = baazaar.cheapest();
+        bool expectOk = balanceBefore >= sink.MIN_BUY_THRESHOLD() && listed && cheapestPrice <= balanceBefore
+            && cheapestPrice <= sink.MAX_BUY_PRICE();
+        _check(ok == expectOk, "canBuy disagrees with the threshold, affordability and cap rules");
+        if (!ok && keccak256(bytes(reason)) == keccak256("cheapest listing above price cap")) ghostCapRefusals += 1;
         try sink.triggerBuy() returns (uint256 acquisitionId) {
             _check(ok, "triggerBuy succeeded although canBuy said no");
+            _check(price <= sink.MAX_BUY_PRICE(), "the crank paid more than the cap");
             _check(acquisitionId == acquisitionsBefore, "acquisition id is not the next one");
             _check(escrow.acquisitionCount() == acquisitionsBefore + 1, "escrow did not register the buy");
             _check(address(sink).balance == balanceBefore - price, "sink did not pay exactly the price");
@@ -278,16 +305,30 @@ contract MarketHandler is Test {
         vm.roll(block.number + escrow.REVEAL_WINDOW_BLOCKS() + 1);
     }
 
+    /// @dev Binds iff the acquisition is pending and the oldest unbound commitment was made in an earlier
+    /// block; a commitment from this very block must wait.
     function requestFlip(uint256 acquisitionSeed) external count("requestFlip") {
         uint256 n = escrow.acquisitionCount();
         if (n == 0) return;
         uint256 id = acquisitionSeed % n;
         FlipEscrow.Status status = escrow.getAcquisition(id).status;
+        uint256 next = escrow.nextCommitment();
+        bool expectOk = status == FlipEscrow.Status.Pending && next < escrow.commitmentCount()
+            && escrow.getCommitment(next).commitBlock < block.number;
+        uint256 versionNow = picker.version();
         try escrow.requestFlip(id) {
-            _check(status == FlipEscrow.Status.Pending, "requestFlip succeeded on a non-pending acquisition");
-            _check(escrow.getAcquisition(id).status == FlipEscrow.Status.Requested, "requestFlip did not bind");
+            _check(expectOk, "requestFlip succeeded without a pending acquisition and an older commitment");
+            FlipEscrow.Acquisition memory a = escrow.getAcquisition(id);
+            _check(a.status == FlipEscrow.Status.Requested, "requestFlip did not bind");
+            _check(a.commitmentIndex == next, "requestFlip skipped the oldest commitment");
+            _check(a.requestBlock == block.number, "request block is not this block");
+            _check(a.pickerVersion == versionNow, "the flip did not freeze the picker's current version");
+            _check(escrow.nextCommitment() == next + 1, "nextCommitment did not advance by one");
             ghostRequestFlipSuccesses += 1;
-        } catch {}
+        } catch {
+            _check(!expectOk, "requestFlip reverted although a pending acquisition and an older commitment exist");
+            _check(escrow.nextCommitment() == next, "a failed requestFlip consumed a commitment");
+        }
     }
 
     function reveal(uint256 acquisitionSeed) external count("reveal") {
@@ -306,8 +347,10 @@ contract MarketHandler is Test {
         uint256 roll = escrow.rollFor(secret, a.requestId);
         bool expectBurn = escrow.isBurnRoll(roll);
         address expectRecipient = DEAD;
+        _check(a.pickerVersion <= picker.version(), "frozen picker version is ahead of the picker");
         if (!expectBurn) {
-            (address winner,) = picker.pick(roll);
+            // The winner is fixed by the registry as it stood when the flip was requested, not now.
+            (address winner,) = picker.pickAt(a.pickerVersion, roll);
             if (winner == address(0)) expectBurn = true;
             else expectRecipient = winner;
         }
@@ -346,6 +389,48 @@ contract MarketHandler is Test {
             _record(id, true, DEAD);
         } catch {
             _check(!expirable, "expire reverted after its deadline");
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Stray NFTs: pushed in without the callback, they are nobody's and can only be burned
+    // ---------------------------------------------------------------------------------------------
+
+    function strayNftToEscrow(uint256 sellerSeed) external count("strayNftToEscrow") {
+        address s = sellers[sellerSeed % sellers.length];
+        uint256 id = nft.mint(s);
+        tokenIds.push(id);
+        uint256 acquisitionsBefore = escrow.acquisitionCount();
+        vm.prank(s);
+        nft.transferFrom(s, address(escrow), id);
+        _check(escrow.acquisitionCount() == acquisitionsBefore, "a plain transfer created an acquisition");
+        (bool found,) = escrow.latestAcquisitionOf(id);
+        _check(!found, "a stray token is recorded as acquired");
+        ghostIsStrayInEscrow[id] = true;
+        ghostStraysInEscrow += 1;
+    }
+
+    /// @dev Sweeping succeeds iff the escrow holds the token and no open acquisition covers it; it burns.
+    function sweepStray(uint256 tokenSeed) external count("sweepStray") {
+        if (tokenIds.length == 0) return;
+        uint256 id = tokenIds[tokenSeed % tokenIds.length];
+        bool held = nft.ownerOf(id) == address(escrow);
+        (bool found, uint256 acquisitionId) = escrow.latestAcquisitionOf(id);
+        bool open = found && escrow.getAcquisition(acquisitionId).status != FlipEscrow.Status.Resolved;
+        bool expectOk = held && !open;
+        try escrow.sweepStray(id) {
+            _check(expectOk, "sweepStray moved a token that was not a stray");
+            _check(nft.ownerOf(id) == DEAD, "swept token was not burned");
+            if (ghostIsStrayInEscrow[id]) {
+                ghostIsStrayInEscrow[id] = false;
+                ghostStraysInEscrow -= 1;
+                ghostStraysSwept += 1;
+            } else {
+                _check(false, "sweepStray burned a token the handler never pushed in as a stray");
+            }
+        } catch {
+            _check(!expectOk, "sweepStray refused a token the escrow holds with no open acquisition");
+            if (held) _check(nft.ownerOf(id) == address(escrow), "a refused sweep moved the token");
         }
     }
 
@@ -473,7 +558,18 @@ contract MarketInvariantTest is StdInvariant, Test {
             owed += baazaar.proceeds(handler.sellers(i));
         }
         assertEq(owed, handler.ghostOutstandingProceeds(), "proceeds ledger tracks sales minus withdrawals");
-        assertEq(address(baazaar).balance, owed + handler.ghostStray(), "baazaar holds exactly what it owes");
+        assertEq(address(baazaar).balance, owed, "baazaar holds exactly what it owes");
+    }
+
+    function invariant_cheapestAboveTheCapIsNeverBought() public view {
+        (bool found,,, uint256 price,) = baazaar.cheapest();
+        (bool ok, string memory reason,,,,) = sink.canBuy();
+        if (found && price > sink.MAX_BUY_PRICE()) {
+            assertFalse(ok, "the crank would buy above the cap");
+            if (address(sink).balance >= sink.MIN_BUY_THRESHOLD() && price <= address(sink).balance) {
+                assertEq(reason, "cheapest listing above price cap");
+            }
+        }
     }
 
     function invariant_activeListingsMatchEscrowedNfts() public view {
@@ -525,8 +621,28 @@ contract MarketInvariantTest is StdInvariant, Test {
                 assertTrue(a.status == FlipEscrow.Status.Pending || a.status == FlipEscrow.Status.Requested, "status");
             }
         }
-        assertEq(nft.balanceOf(address(escrow)), unresolved, "escrow holds nothing else");
+        assertEq(
+            nft.balanceOf(address(escrow)),
+            unresolved + handler.ghostStraysInEscrow(),
+            "escrow holds nothing beyond open acquisitions and unswept strays"
+        );
         assertEq(address(escrow).balance, 0, "escrow never holds ETH");
+    }
+
+    function invariant_requestedFlipsFreezeAVersionThePickerStillAnswersFor() public view {
+        uint256 n = escrow.acquisitionCount();
+        for (uint256 id = 0; id < n; id++) {
+            FlipEscrow.Acquisition memory a = escrow.getAcquisition(id);
+            if (a.requestId == bytes32(0)) {
+                assertEq(a.pickerVersion, 0, "an unbound acquisition carries a version");
+                continue;
+            }
+            assertLe(a.pickerVersion, picker.version(), "frozen version is ahead of the picker");
+            assertGe(a.requestBlock, a.receivedBlock, "requested before received");
+            if (a.status == FlipEscrow.Status.Resolved && !a.burned) {
+                assertGt(picker.weightOfAt(a.recipient, a.pickerVersion), 0, "airdrop winner had no weight then");
+            }
+        }
     }
 
     function invariant_resolvedAcquisitionsNeverReopen() public view {
@@ -556,7 +672,7 @@ contract MarketInvariantTest is StdInvariant, Test {
                 FlipEscrow.Acquisition memory a = escrow.getAcquisition(c.acquisitionId);
                 assertEq(a.commitmentIndex, i, "bound acquisition points back at the commitment");
                 assertTrue(a.status != FlipEscrow.Status.Pending, "bound acquisition is not pending");
-                assertLt(c.commitBlock, a.receivedBlock, "commitment predates the acquisition it serves");
+                assertLt(c.commitBlock, a.requestBlock, "commitment predates the block that bound it");
             } else {
                 assertFalse(c.bound, "unconsumed commitment is unbound");
             }
@@ -615,5 +731,7 @@ contract MarketInvariantTest is StdInvariant, Test {
         emit log_named_uint("deliveries by third parties", handler.ghostEscrowDeliveries());
         emit log_named_uint("resolved", handler.ghostResolvedCount());
         emit log_named_uint("requestFlip successes", handler.ghostRequestFlipSuccesses());
+        emit log_named_uint("cranks refused by the price cap", handler.ghostCapRefusals());
+        emit log_named_uint("strays swept", handler.ghostStraysSwept());
     }
 }

@@ -81,21 +81,23 @@ contract FeeSinkEdgeTest is GotchiFixture {
         sink.triggerBuy();
     }
 
-    /// @dev `canBuy` must agree with `triggerBuy` for any balance and any (or no) listing.
+    /// @dev `canBuy` must agree with `triggerBuy` for any balance and any (or no) listing, including
+    /// listings above the per-purchase cap.
     function testFuzz_canBuyPredictsTriggerBuy(uint256 balance, uint256 price, bool listed) public {
-        balance = bound(balance, 0, 0.05 ether);
-        price = bound(price, 1, 0.05 ether);
+        balance = bound(balance, 0, 0.25 ether);
+        price = bound(price, 1, 0.2 ether);
         uint256 tokenId = 0;
         if (listed) (, tokenId) = mintAndList(seller, price);
         if (balance > 0) _fund(balance);
 
         (bool ok, string memory reason,,, uint256 quotedPrice,) = sink.canBuy();
-        bool expected = balance >= 0.01 ether && listed && price <= balance;
+        bool expected = balance >= 0.01 ether && listed && price <= balance && price <= 0.1 ether;
         assertEq(ok, expected, "canBuy prediction");
         if (!expected) {
             if (balance < 0.01 ether) assertEq(reason, "below threshold");
             else if (!listed) assertEq(reason, "no listing");
-            else assertEq(reason, "cannot afford cheapest listing");
+            else if (price > balance) assertEq(reason, "cannot afford cheapest listing");
+            else assertEq(reason, "cheapest listing above price cap");
         }
 
         if (expected) {
@@ -121,20 +123,52 @@ contract FeeSinkEdgeTest is GotchiFixture {
         (bool ok,) = address(sink).call{value: 0.5 ether}("");
         assertTrue(ok);
         assertEq(sink.totalCollected(), 0.5 ether);
-        // Donations are spent exactly like fees.
-        mintAndList(seller, 0.4 ether);
+        // Donations are spent exactly like fees, and like fees they never buy above the cap: a rich sink
+        // facing a 0.4 ETH listing waits.
+        (, uint256 dearId) = mintAndList(seller, 0.4 ether);
+        vm.expectRevert(abi.encodeWithSelector(FeeSink.PriceAboveCap.selector, 0.4 ether, 0.1 ether));
         sink.triggerBuy();
-        assertEq(address(sink).balance, 0.1 ether);
+        assertEq(nft.ownerOf(dearId), address(baazaar), "the dear listing stays listed");
+        // A listing at exactly the cap is bought.
+        (, uint256 capId) = mintAndList(seller, 0.1 ether);
+        sink.triggerBuy();
+        assertEq(nft.ownerOf(capId), address(escrow));
+        assertEq(address(sink).balance, 0.4 ether);
+        assertEq(sink.totalSpent(), 0.1 ether);
+    }
+
+    function test_oneWeiAboveTheCapIsRefusedAndNothingIsArmed() public {
+        _fund(1 ether);
+        mintAndList(seller, 0.1 ether + 1);
+        (bool ok, string memory reason,,,,) = sink.canBuy();
+        assertFalse(ok);
+        assertEq(reason, "cheapest listing above price cap");
+        vm.expectRevert(abi.encodeWithSelector(FeeSink.PriceAboveCap.selector, 0.1 ether + 1, 0.1 ether));
+        sink.triggerBuy();
+        assertEq(sink.pendingPayment(), 0);
+        assertEq(sink.buyCount(), 0);
+        assertEq(address(sink).balance, 1 ether);
+    }
+
+    function test_capIsCheckedAfterAffordabilitySoAPoorSinkReportsAffordabilityFirst() public {
+        _fund(0.05 ether);
+        mintAndList(seller, 0.2 ether);
+        (bool ok, string memory reason,,,,) = sink.canBuy();
+        assertFalse(ok);
+        assertEq(reason, "cannot afford cheapest listing");
+        vm.expectRevert(abi.encodeWithSelector(FeeSink.CannotAfford.selector, 0.2 ether, 0.05 ether));
+        sink.triggerBuy();
     }
 
     function test_noAdminSelectorMovesEthOrChangesWiring() public {
         _fund(1 ether);
-        string[8] memory signatures = [
+        string[9] memory signatures = [
             "withdraw()",
             "withdraw(uint256)",
             "sweep(address)",
             "rescue(address,uint256)",
             "setThreshold(uint256)",
+            "setMaxBuyPrice(uint256)",
             "setBaazaar(address)",
             "setEscrow(address)",
             "transferOwnership(address)"
@@ -147,6 +181,7 @@ contract FeeSinkEdgeTest is GotchiFixture {
         assertEq(address(sink.BAAZAAR()), address(baazaar));
         assertEq(address(sink.ESCROW()), address(escrow));
         assertEq(sink.MIN_BUY_THRESHOLD(), 0.01 ether);
+        assertEq(sink.MAX_BUY_PRICE(), 0.1 ether);
     }
 
     function test_aContractKeeperCanCrank() public {
