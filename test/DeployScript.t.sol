@@ -113,30 +113,96 @@ contract DeployScriptTest is Test {
         script.deploy(cfg);
     }
 
-    /// @dev The two front-running windows the stack deployer closes: binding the sink to a fresh hook and
-    /// initializing the pool key before the script does. Both now happen inside one call.
+    /// @dev The three front-running windows the stack deployer closes: binding the sink to a fresh hook,
+    /// initializing the pool key before the script does, and moving the empty pool's price before the
+    /// initial liquidity lands. All of it happens inside one call.
     function test_stackDeployerIsAtomicAndOnlyForItsDeployer() public {
         DeployGotchiSepolia.Deployment memory d = script.deploy(_config());
+        assertGt(IPoolManager(address(manager)).getLiquidity(d.forever.poolId()), 0, "never an empty pool");
 
         // A stranger cannot use the helper (and so cannot consume a mined salt).
         bytes memory creationCode = abi.encodePacked(type(GotchiFeeHook).creationCode, abi.encode(address(manager)));
         (, bytes32 salt) = HookMiner.find(address(d.stackDeployer), 0xCC, creationCode, uint256(d.hookSalt) + 1);
         vm.prank(makeAddr("stranger"));
         vm.expectRevert(GotchiStackDeployer.NotDeployer.selector);
-        d.stackDeployer.deploy(salt, address(d.token), address(d.baazaar), address(d.escrow), d.sqrtPriceX96);
+        d.stackDeployer.deploy(salt, address(d.token), address(d.baazaar), address(d.escrow), d.sqrtPriceX96, 0);
 
-        // The deployer itself can run it again with a fresh salt: new hook, bound sink, initialized pool.
+        // The deployer itself can run it again with a fresh salt and no liquidity: new hook, bound sink,
+        // initialized (empty) pool.
         vm.prank(address(script));
-        (GotchiFeeHook hook2,, ForeverLiquidity forever2) =
-            d.stackDeployer.deploy(salt, address(d.token), address(d.baazaar), address(d.escrow), d.sqrtPriceX96);
+        (GotchiFeeHook hook2,, ForeverLiquidity forever2, uint128 liquidity2) =
+            d.stackDeployer.deploy(salt, address(d.token), address(d.baazaar), address(d.escrow), d.sqrtPriceX96, 0);
         assertTrue(hook2.addressHasValidFlags());
         assertTrue(hook2.feeSink() != address(0));
+        assertEq(liquidity2, 0);
         (uint160 price,,,) = IPoolManager(address(manager)).getSlot0(forever2.poolId());
         assertEq(price, d.sqrtPriceX96, "pool initialized in the same call");
 
         // A salt whose address lacks the flags is refused before anything is bound.
         vm.prank(address(script));
         vm.expectRevert();
-        d.stackDeployer.deploy(bytes32(uint256(salt) + 1), address(d.token), address(d.baazaar), address(d.escrow), 1);
+        d.stackDeployer
+            .deploy(bytes32(uint256(salt) + 1), address(d.token), address(d.baazaar), address(d.escrow), 1, 0);
+    }
+
+    uint256 constant SECOND_ETH = 0.05 ether;
+    uint256 constant SECOND_TOKENS = 70_000_000e18;
+
+    /// @dev Runs the helper a second time, as the deployer, with liquidity amounts that do not match the
+    /// price exactly (so the helper must return the unused side).
+    function _deploySecondStack(DeployGotchiSepolia.Deployment memory d)
+        internal
+        returns (GotchiFeeHook hook2, ForeverLiquidity forever2, uint128 liquidity2)
+    {
+        bytes memory creationCode = abi.encodePacked(type(GotchiFeeHook).creationCode, abi.encode(address(manager)));
+        (, bytes32 salt) = HookMiner.find(address(d.stackDeployer), 0xCC, creationCode, uint256(d.hookSalt) + 1);
+        vm.startPrank(address(script));
+        d.token.approve(address(d.stackDeployer), SECOND_TOKENS);
+        (hook2,, forever2, liquidity2) = d.stackDeployer.deploy{value: SECOND_ETH}(
+            salt, address(d.token), address(d.baazaar), address(d.escrow), d.sqrtPriceX96, SECOND_TOKENS
+        );
+        vm.stopPrank();
+    }
+
+    function test_stackDeployerLocksTheInitialLiquidityInTheSameCallAndRefundsDust() public {
+        DeployGotchiSepolia.Deployment memory d = script.deploy(_config());
+        uint256 scriptEth = address(script).balance;
+        uint256 scriptTokens = d.token.balanceOf(address(script));
+        (GotchiFeeHook hook2, ForeverLiquidity forever2, uint128 liquidity2) = _deploySecondStack(d);
+
+        IPoolManager pm = IPoolManager(address(manager));
+        assertGt(liquidity2, 0);
+        assertEq(pm.getLiquidity(forever2.poolId()), liquidity2, "liquidity locked in the deploying call");
+        (uint128 positionLiquidity,,) =
+            pm.getPositionInfo(forever2.poolId(), address(forever2), -887_220, 887_220, bytes32(0));
+        assertEq(positionLiquidity, liquidity2);
+        assertTrue(hook2.feeSink() != address(0));
+        (uint256 usedEth, uint256 usedTokens) = forever2.amountsForLiquidity(liquidity2);
+        assertLe(usedEth, SECOND_ETH);
+        assertLe(usedTokens, SECOND_TOKENS);
+        assertEq(address(script).balance, scriptEth - usedEth, "unused ETH came back");
+        assertEq(d.token.balanceOf(address(script)), scriptTokens - usedTokens, "unused tokens came back");
+        assertEq(address(d.stackDeployer).balance, 0, "the helper keeps nothing");
+        assertEq(d.token.balanceOf(address(d.stackDeployer)), 0);
+        assertEq(d.token.balanceOf(address(forever2)), 0);
+        assertEq(address(forever2).balance, 0);
+    }
+
+    function test_stackDeployerRejectsAmountsThatFundNoLiquidityAndStrayEth() public {
+        DeployGotchiSepolia.Deployment memory d = script.deploy(_config());
+        bytes memory creationCode = abi.encodePacked(type(GotchiFeeHook).creationCode, abi.encode(address(manager)));
+        (, bytes32 salt) = HookMiner.find(address(d.stackDeployer), 0xCC, creationCode, uint256(d.hookSalt) + 1);
+
+        // ETH only, no tokens, at a two-sided price: nothing can be locked, so nothing is deployed.
+        vm.prank(address(script));
+        vm.expectRevert(GotchiStackDeployer.ZeroInitialLiquidity.selector);
+        d.stackDeployer.deploy{value: 1 ether}(
+            salt, address(d.token), address(d.baazaar), address(d.escrow), d.sqrtPriceX96, 0
+        );
+
+        // The helper only accepts ETH from the ForeverLiquidity it is funding, inside `deploy`.
+        vm.expectRevert(GotchiStackDeployer.UnexpectedEth.selector);
+        (bool ok,) = address(d.stackDeployer).call{value: 1 wei}("");
+        ok;
     }
 }

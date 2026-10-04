@@ -16,12 +16,13 @@ import {HolderWeightedPicker} from "./HolderWeightedPicker.sol";
 ///  2. When an acquisition arrives it is bound to the oldest unused commitment, provided that commitment
 ///     was made in an earlier block than the binding (`FlipRequested`). If none qualifies it waits as
 ///     `Pending`; once the operator has committed (in an earlier block) anyone binds it with `requestFlip`.
-///     Binding also records the picker's `version()`, freezing the set of eligible holders and their
-///     weights for this flip.
+///     Binding also records the picker snapshot for this flip: the block before the request. The eligible
+///     holders and their weights are the GOTCHI deposited in the picker as of the end of that block.
 ///  3. Anyone who knows the secret calls `reveal`. The roll is
 ///     `keccak256(abi.encode(secret, requestId))`; `roll % 10_000 < FLIP_BURN_BPS` burns, otherwise the
-///     picker chooses the recipient against the frozen version (no eligible holder, or every draw stale,
-///     falls back to a burn).
+///     picker chooses the recipient against the frozen snapshot (no eligible holder falls back to a burn).
+///     The picker custodies the deposited tokens and reads nothing live at resolution, so a deposit,
+///     withdrawal or token transfer made once the roll is knowable cannot change who wins.
 ///  4. A commitment whose secret is withheld past `REVEAL_WINDOW_BLOCKS`, or an acquisition left
 ///     `Pending` past `PENDING_TIMEOUT_BLOCKS`, is force-burned by anyone through `expire`.
 ///
@@ -30,9 +31,9 @@ import {HolderWeightedPicker} from "./HolderWeightedPicker.sol";
 /// picks) is known to the operator before committing, so the OPERATOR can grind secrets off-chain and
 /// choose each flip's outcome and, through the picker, its winner; the operator can also withhold a
 /// reveal, which turns that flip into a burn. Holders are protected only against *third parties*: once a
-/// flip is requested nobody can change its eligible set, and nobody but the operator can learn the roll
-/// before the reveal. Chainlink VRF on Sepolia is the documented upgrade that removes the operator's
-/// power; until then the operator is trusted for fairness, not just liveness.
+/// flip is requested nothing can change its eligible set or weights, and nobody but the operator can
+/// learn the roll before the reveal. Chainlink VRF on Sepolia is the documented upgrade that removes the
+/// operator's power; until then the operator is trusted for fairness, not just liveness.
 contract FlipEscrow is IERC721Receiver, ReentrancyGuard {
     enum Status {
         None,
@@ -48,7 +49,8 @@ contract FlipEscrow is IERC721Receiver, ReentrancyGuard {
         uint256 receivedBlock;
         uint256 requestBlock;
         bytes32 requestId;
-        uint256 pickerVersion;
+        /// @dev The block whose end-of-block picker state decides this flip (the block before the request).
+        uint256 pickerSnapshotBlock;
         bool burned;
         address recipient;
     }
@@ -184,7 +186,7 @@ contract FlipEscrow is IERC721Receiver, ReentrancyGuard {
                 receivedBlock: block.number,
                 requestBlock: 0,
                 requestId: bytes32(0),
-                pickerVersion: 0,
+                pickerSnapshotBlock: 0,
                 burned: false,
                 recipient: address(0)
             })
@@ -206,7 +208,9 @@ contract FlipEscrow is IERC721Receiver, ReentrancyGuard {
     /// needs checking: it must have been made in an earlier block than this binding, so that the
     /// operator could not have seen a same-block state when choosing it. A commitment made after the NFT
     /// arrived is eligible for a `Pending` acquisition (the operator then knows the token id; see the
-    /// trust model above).
+    /// trust model above). The picker snapshot is the block before the binding, so a deposit in the
+    /// binding block (for instance a flash-loaned one in the very transaction that triggers the purchase)
+    /// does not count for this flip. `block.number >= 1` here because the commitment's block is smaller.
     function _tryRequest(uint256 acquisitionId) private returns (bool) {
         if (nextCommitment >= _commitments.length) return false;
         Acquisition storage acquisition = _acquisitions[acquisitionId];
@@ -222,7 +226,7 @@ contract FlipEscrow is IERC721Receiver, ReentrancyGuard {
         acquisition.commitmentIndex = index;
         acquisition.requestBlock = block.number;
         acquisition.requestId = requestId;
-        acquisition.pickerVersion = PICKER.version();
+        acquisition.pickerSnapshotBlock = block.number - 1;
         emit FlipRequested(acquisitionId, acquisition.tokenId, requestId);
         return true;
     }
@@ -232,7 +236,7 @@ contract FlipEscrow is IERC721Receiver, ReentrancyGuard {
     // ---------------------------------------------------------------------------------------------
 
     /// @notice Reveals the secret behind the acquisition's commitment and resolves the flip against the
-    /// picker state frozen when the flip was requested.
+    /// picker state as of the end of the block before the request.
     function reveal(uint256 acquisitionId, bytes32 secret) external nonReentrant {
         Acquisition storage acquisition = _get(acquisitionId);
         if (acquisition.status != Status.Requested) revert InvalidStatus(acquisitionId, acquisition.status);
@@ -246,7 +250,7 @@ contract FlipEscrow is IERC721Receiver, ReentrancyGuard {
         address recipient = BURN_ADDRESS;
         uint256 weight = 0;
         if (!burned) {
-            (address winner, uint256 winnerWeight) = PICKER.drawAt(acquisition.pickerVersion, roll);
+            (address winner, uint256 winnerWeight) = PICKER.pickAt(acquisition.pickerSnapshotBlock, roll);
             if (winner == address(0)) {
                 burned = true;
             } else {

@@ -38,9 +38,9 @@ contract EndToEndTest is GotchiFixture {
     }
 
     function _stageHoldersInventoryAndCommitments() internal {
-        fundAndRegister(alice, 1_000e18);
-        fundAndRegister(bob, 3_000e18);
-        fundAndRegister(carol, 6_000e18);
+        fundAndDeposit(alice, 1_000e18);
+        fundAndDeposit(bob, 3_000e18);
+        fundAndDeposit(carol, 6_000e18);
         assertEq(picker.totalWeight(), 10_000e18);
 
         (dearListing, dearId) = mintAndList(seller, 0.006 ether);
@@ -110,9 +110,9 @@ contract EndToEndTest is GotchiFixture {
 
         // Flip 1 airdrops to the weighted pick, taken against the registry frozen at the request.
         uint256 roll = escrow.rollFor(secretDrop, escrow.getAcquisition(1).requestId);
-        (address winner, uint256 weight) = picker.pickAt(escrow.getAcquisition(1).pickerVersion, roll);
+        (address winner, uint256 weight) = picker.pickAt(escrow.getAcquisition(1).pickerSnapshotBlock, roll);
         assertTrue(winner == alice || winner == bob || winner == carol);
-        assertEq(weight, token.balanceOf(winner));
+        assertEq(weight, picker.weightOf(winner));
         vm.expectEmit(true, true, false, true, address(escrow));
         emit FlipEscrow.FlipResolved(1, dearId, false, winner);
         vm.expectEmit(true, true, false, true, address(escrow));
@@ -164,7 +164,7 @@ contract EndToEndTest is GotchiFixture {
     }
 
     function test_buyWithoutAnyCommitmentIsFlippedOnceTheOperatorCommits() public {
-        fundAndRegister(alice, 1_000e18);
+        fundAndDeposit(alice, 1_000e18);
         mintAndList(seller, 0.004 ether);
         swap(key, true, -4 ether);
         uint256 acquisitionId = sink.triggerBuy();
@@ -181,6 +181,6 @@ contract EndToEndTest is GotchiFixture {
         emit FlipEscrow.FlipRequested(acquisitionId, tokenId, escrow.computeRequestId(acquisitionId, tokenId, 0, hash));
         escrow.requestFlip(acquisitionId);
         escrow.reveal(acquisitionId, secret);
-        assertEq(nft.ownerOf(tokenId), alice, "the only registered holder receives the airdrop");
+        assertEq(nft.ownerOf(tokenId), alice, "the only depositor receives the airdrop");
     }
 }

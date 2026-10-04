@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
+import {IERC20Errors} from "@openzeppelin/contracts/interfaces/IERC6093.sol";
 import {LaunchToken} from "../src/LaunchToken.sol";
 import {MockAavegotchi} from "../src/MockAavegotchi.sol";
 import {HolderWeightedPicker} from "../src/HolderWeightedPicker.sol";
@@ -64,13 +65,17 @@ contract FlipEscrowTest is Test {
         revert("no secret");
     }
 
+    function _deposit(address holder, uint256 amount) internal {
+        token.transfer(holder, amount);
+        vm.startPrank(holder);
+        token.approve(address(picker), amount);
+        picker.deposit(amount);
+        vm.stopPrank();
+    }
+
     function _registerHolders() internal {
-        token.transfer(alice, 25e18);
-        token.transfer(bob, 75e18);
-        vm.prank(alice);
-        picker.register();
-        vm.prank(bob);
-        picker.register();
+        _deposit(alice, 25e18);
+        _deposit(bob, 75e18);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -222,7 +227,7 @@ contract FlipEscrowTest is Test {
         escrow.requestFlip(0);
         FlipEscrow.Acquisition memory a = escrow.getAcquisition(0);
         assertEq(uint8(a.status), uint8(FlipEscrow.Status.Requested));
-        assertEq(a.pickerVersion, picker.version(), "eligible set frozen at the request");
+        assertEq(a.pickerSnapshotBlock, 150, "eligible set frozen at the end of the block before the request");
 
         escrow.reveal(0, secret);
         address owner = nft.ownerOf(id);
@@ -335,26 +340,29 @@ contract FlipEscrowTest is Test {
         assertEq(nft.ownerOf(id), DEAD);
     }
 
-    function test_airdropRollWithEveryDrawStaleBurns() public {
+    function test_airdropRollWhenEveryDepositWasWithdrawnBeforeTheSnapshotBurns() public {
         _registerHolders();
+        vm.prank(alice);
+        picker.withdraw(25e18);
+        vm.prank(bob);
+        picker.withdraw(75e18);
         uint256 expectedId = nft.nextTokenId();
         (bytes32 secret, bytes32 hash) = _findSecret(0, expectedId, 0, false);
         _commit(hash);
         vm.roll(101);
         uint256 id = _mintToBaazaar();
         _deliver(id);
-        // Both registered holders move one wei away without refreshing: every draw is stale.
-        vm.prank(alice);
-        token.transfer(address(0xBEEF), 1);
-        vm.prank(bob);
-        token.transfer(address(0xBEEF), 1);
         vm.expectEmit(true, true, false, true, address(escrow));
         emit FlipEscrow.FlipResolved(0, id, true, DEAD);
         escrow.reveal(0, secret);
-        assertEq(nft.ownerOf(id), DEAD, "stale weights forfeit to a burn");
+        assertEq(nft.ownerOf(id), DEAD, "registered holders with zero weight at the snapshot: burn");
     }
 
-    function test_airdropRollWithOneStaleHolderRedrawsToTheOther() public {
+    // ---------------------------------------------------------------------------------------------
+    // Reveal: the eligible set and the weights are frozen at the block before the request
+    // ---------------------------------------------------------------------------------------------
+
+    function test_depositAfterTheRequestCannotWinThatFlip() public {
         _registerHolders();
         uint256 expectedId = nft.nextTokenId();
         (bytes32 secret, bytes32 hash) = _findSecret(0, expectedId, 0, false);
@@ -362,39 +370,11 @@ contract FlipEscrowTest is Test {
         vm.roll(101);
         uint256 id = _mintToBaazaar();
         _deliver(id);
-        uint256 roll = escrow.rollFor(secret, escrow.getAcquisition(0).requestId);
-        (address firstDraw,) = picker.pick(roll);
-        address other = firstDraw == alice ? bob : alice;
-        // The first draw's holder moves one wei away without refreshing; the re-draws can only land on
-        // the other holder (or forfeit if every one of them hits the stale holder again).
-        vm.prank(firstDraw);
-        token.transfer(address(0xBEEF), 1);
-        (address expected,) = picker.pickAt(escrow.getAcquisition(0).pickerVersion, roll);
-        assertTrue(expected == other || expected == address(0));
-        uint256 versionBefore = picker.version();
-        escrow.reveal(0, secret);
-        assertEq(nft.ownerOf(id), expected == address(0) ? DEAD : expected, "re-drawn past the stale holder");
-        assertEq(picker.weightOf(firstDraw), token.balanceOf(firstDraw), "the stale entry was refreshed");
-        assertGt(picker.version(), versionBefore);
-    }
-
-    // ---------------------------------------------------------------------------------------------
-    // Reveal: the eligible set is frozen at the request
-    // ---------------------------------------------------------------------------------------------
-
-    function test_registrationAfterTheRequestCannotWinThatFlip() public {
-        _registerHolders();
-        uint256 expectedId = nft.nextTokenId();
-        (bytes32 secret, bytes32 hash) = _findSecret(0, expectedId, 0, false);
-        _commit(hash);
-        vm.roll(101);
-        uint256 id = _mintToBaazaar();
-        _deliver(id);
-        uint256 frozen = escrow.getAcquisition(0).pickerVersion;
-        assertEq(frozen, picker.version());
+        uint256 frozen = escrow.getAcquisition(0).pickerSnapshotBlock;
+        assertEq(frozen, 100);
 
         // The reveal is public: a late entrant funds exactly the weight that would catch the roll against
-        // the *current* registry and registers before the reveal lands.
+        // the *current* registry and deposits before the reveal lands.
         uint256 roll = escrow.rollFor(secret, escrow.getAcquisition(0).requestId);
         uint256 honest = picker.totalWeight();
         address attacker = makeAddr("attacker");
@@ -406,9 +386,7 @@ contract FlipEscrowTest is Test {
             }
         }
         assertGt(w, 0);
-        token.transfer(attacker, w);
-        vm.prank(attacker);
-        picker.register();
+        _deposit(attacker, w);
         (address liveWinner,) = picker.pick(roll);
         assertEq(liveWinner, attacker, "against the live registry the attacker would win");
         (address frozenWinner, uint256 frozenWeight) = picker.pickAt(frozen, roll);
@@ -420,7 +398,26 @@ contract FlipEscrowTest is Test {
         assertEq(nft.ownerOf(id), frozenWinner, "the frozen registry decides");
     }
 
-    function test_refreshAfterTheRequestCannotChangeTheWinner() public {
+    function test_depositInTheRequestBlockDoesNotCountForThatFlip() public {
+        // Alice deposits a block ahead; bob deposits a huge weight in the request block itself, before the
+        // delivery (the flash-loan shape: deposit, trigger the purchase, withdraw, all in one block).
+        _deposit(alice, 25e18);
+        uint256 expectedId = nft.nextTokenId();
+        (bytes32 secret, bytes32 hash) = _findSecret(0, expectedId, 0, false);
+        _commit(hash);
+        vm.roll(101);
+        _deposit(bob, 1_000_000e18);
+        uint256 id = _mintToBaazaar();
+        _deliver(id);
+        vm.prank(bob);
+        picker.withdraw(1_000_000e18);
+        assertEq(escrow.getAcquisition(0).pickerSnapshotBlock, 100);
+        assertEq(picker.totalWeightAt(100), 25e18, "only alice had weight at the end of block 100");
+        escrow.reveal(0, secret);
+        assertEq(nft.ownerOf(id), alice, "the same-block depositor never counted");
+    }
+
+    function test_withdrawalAfterTheRequestCannotChangeTheWinner() public {
         _registerHolders();
         uint256 expectedId = nft.nextTokenId();
         (bytes32 secret, bytes32 hash) = _findSecret(0, expectedId, 0, false);
@@ -429,13 +426,76 @@ contract FlipEscrowTest is Test {
         uint256 id = _mintToBaazaar();
         _deliver(id);
         uint256 roll = escrow.rollFor(secret, escrow.getAcquisition(0).requestId);
-        (address frozenWinner,) = picker.pickAt(escrow.getAcquisition(0).pickerVersion, roll);
+        (address frozenWinner, uint256 frozenWeight) = picker.pickAt(escrow.getAcquisition(0).pickerSnapshotBlock, roll);
         address loser = frozenWinner == alice ? bob : alice;
-        // The loser pumps their weight after the request: irrelevant to this flip.
-        token.transfer(loser, 1_000_000e18);
-        picker.refresh(loser);
+        // Everyone withdraws and the loser re-deposits a huge weight after the request: irrelevant.
+        vm.roll(102);
+        vm.prank(alice);
+        picker.withdraw(25e18);
+        vm.prank(bob);
+        picker.withdraw(75e18);
+        _deposit(loser, 1_000_000e18);
+        (address liveWinner,) = picker.pick(roll);
+        assertEq(liveWinner, loser, "against the live registry the loser would win");
+        vm.expectEmit(true, true, false, true, address(escrow));
+        emit FlipEscrow.Airdropped(id, frozenWinner, frozenWeight);
         escrow.reveal(0, secret);
-        assertEq(nft.ownerOf(id), frozenWinner);
+        assertEq(nft.ownerOf(id), frozenWinner, "the snapshot decides, with the snapshot weight");
+    }
+
+    function test_oneBagBehindManyWalletsCannotBeSteeredIntoWinning() public {
+        // The reviewer's scenario: alice holds 100 GOTCHI; the attacker tries to register the SAME 100 GOTCHI
+        // through ten wallets and then move the bag to whichever wallet the public roll selects. With
+        // custody, depositing locks the bag, so only one of the ten wallets ever carries weight, and moving
+        // it after the request is a checkpoint the frozen snapshot does not see.
+        uint256 bag = 100e18;
+        _deposit(alice, bag);
+        address[10] memory sybils;
+        for (uint256 i = 0; i < 10; i++) {
+            sybils[i] = makeAddr(string.concat("sybil", vm.toString(i)));
+        }
+        _deposit(sybils[0], bag);
+        for (uint256 i = 1; i < 10; i++) {
+            vm.prank(sybils[i - 1]);
+            vm.expectRevert(
+                abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, sybils[i - 1], 0, bag)
+            );
+            token.transfer(sybils[i], bag);
+            vm.startPrank(sybils[i]);
+            token.approve(address(picker), bag);
+            vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, sybils[i], 0, bag));
+            picker.deposit(bag);
+            vm.stopPrank();
+        }
+        assertEq(picker.totalWeight(), 2 * bag, "100 GOTCHI of attacker tokens carry 100 of weight, not 1,000");
+
+        uint256 expectedId = nft.nextTokenId();
+        (bytes32 secret, bytes32 hash) = _findSecret(0, expectedId, 0, false);
+        _commit(hash);
+        vm.roll(101);
+        uint256 id = _mintToBaazaar();
+        _deliver(id);
+        uint256 frozen = escrow.getAcquisition(0).pickerSnapshotBlock;
+        uint256 roll = escrow.rollFor(secret, escrow.getAcquisition(0).requestId);
+        (address frozenWinner,) = picker.pickAt(frozen, roll);
+        assertTrue(frozenWinner == alice || frozenWinner == sybils[0]);
+
+        // The reveal is in the mempool. The attacker moves the bag to another wallet (withdraw, transfer,
+        // deposit) ahead of it. Nothing changes for this flip.
+        vm.roll(102);
+        vm.prank(sybils[0]);
+        picker.withdraw(bag);
+        vm.prank(sybils[0]);
+        token.transfer(sybils[7], bag);
+        vm.startPrank(sybils[7]);
+        token.approve(address(picker), bag);
+        picker.deposit(bag);
+        vm.stopPrank();
+        escrow.reveal(0, secret);
+        assertEq(nft.ownerOf(id), frozenWinner, "the snapshot winner, chosen before the roll was knowable");
+        for (uint256 i = 1; i < 10; i++) {
+            assertTrue(nft.ownerOf(id) != sybils[i], "a wallet with no deposit at the snapshot cannot win");
+        }
     }
 
     // ---------------------------------------------------------------------------------------------

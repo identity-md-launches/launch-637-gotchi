@@ -301,7 +301,7 @@
             "internalType": "bytes32"
           },
           {
-            "name": "pickerVersion",
+            "name": "pickerSnapshotBlock",
             "type": "uint256",
             "internalType": "uint256"
           },

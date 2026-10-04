@@ -19,8 +19,8 @@ import {PriceMath} from "../src/PriceMath.sol";
 /// @title DeployGotchiSepolia
 /// @notice Optional Sepolia deployment of the whole $GOTCHI stack: token, mock NFT, mock Baazaar, picker,
 /// escrow, then (in one transaction through `GotchiStackDeployer`) the hook at a mined CREATE2 address,
-/// the FeeSink bound to it, ForeverLiquidity and the pool initialization, and finally the initial forever
-/// liquidity behind an exact-price guard.
+/// the FeeSink bound to it, ForeverLiquidity, the pool initialization and the initial forever liquidity
+/// behind an exact-price guard. Only the token approval to the helper is a separate, harmless transaction.
 ///
 /// Usage (simulate first, then broadcast from a reviewed signer, one transaction at a time):
 ///
@@ -73,8 +73,8 @@ contract DeployGotchiSepolia is Script {
     uint256 public constant DEFAULT_INITIAL_ETH = 0.1 ether;
     uint256 public constant DEFAULT_INITIAL_TOKENS = 100_000_000e18;
 
-    /// @dev `ForeverLiquidity.addLiquidityWithin` refunds rounding dust to its caller; when the tests
-    /// call `deploy` directly that caller is this contract.
+    /// @dev `GotchiStackDeployer.deploy` refunds rounding dust to its caller; when the tests call `deploy`
+    /// directly that caller is this contract.
     receive() external payable {}
 
     function run() external returns (Deployment memory deployment) {
@@ -108,27 +108,25 @@ contract DeployGotchiSepolia is Script {
         d.picker = new HolderWeightedPicker(address(d.token), cfg.poolManager);
         d.escrow = new FlipEscrow(address(d.nft), address(d.baazaar), address(d.picker), cfg.operator);
 
-        // Hook + FeeSink + ForeverLiquidity + pool initialization, atomically. The hook's CREATE2 address
-        // depends on the fresh helper's address, so a salt mined against it is unused by construction.
+        // Hook + FeeSink + ForeverLiquidity + pool initialization + initial liquidity, atomically. The hook's
+        // CREATE2 address depends on the fresh helper's address, so a salt mined against it is unused by
+        // construction. The pool never exists without liquidity, so nobody can move its price before the
+        // exact-band deposit lands.
         d.stackDeployer = new GotchiStackDeployer(cfg.poolManager);
         bytes memory creationCode = abi.encodePacked(type(GotchiFeeHook).creationCode, abi.encode(cfg.poolManager));
         (address predicted, bytes32 salt) =
             HookMiner.find(address(d.stackDeployer), GotchiFeeHookFlags.FLAGS, creationCode, 0);
         d.hookSalt = salt;
         d.sqrtPriceX96 = _sqrtPriceFor(cfg);
-        (d.hook, d.sink, d.forever) =
-            d.stackDeployer.deploy(salt, address(d.token), address(d.baazaar), address(d.escrow), d.sqrtPriceX96);
+        d.token.approve(address(d.stackDeployer), cfg.initialLiquidityTokens);
+        (d.hook, d.sink, d.forever, d.liquidity) = d.stackDeployer.deploy{value: cfg.initialLiquidityEth}(
+            salt, address(d.token), address(d.baazaar), address(d.escrow), d.sqrtPriceX96, cfg.initialLiquidityTokens
+        );
         require(address(d.hook) == predicted, "hook address differs from the mined one");
         require(d.hook.addressHasValidFlags(), "hook address lacks its flags");
         require(d.hook.feeSink() == address(d.sink), "sink is not bound to the hook");
+        require(d.liquidity > 0, "no initial liquidity");
         d.key = d.forever.poolKey();
-
-        // Initial forever liquidity, only at exactly the price just set.
-        d.liquidity = d.forever.liquidityForAmounts(cfg.initialLiquidityEth, cfg.initialLiquidityTokens);
-        d.token.approve(address(d.forever), cfg.initialLiquidityTokens);
-        d.forever.addLiquidityWithin{value: cfg.initialLiquidityEth}(
-            d.liquidity, cfg.initialLiquidityTokens, d.sqrtPriceX96, d.sqrtPriceX96
-        );
     }
 
     /// @dev The opening price implied by the configured amounts, computed with the same library

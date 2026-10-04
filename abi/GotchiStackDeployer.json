@@ -11,6 +11,10 @@
     "stateMutability": "nonpayable"
   },
   {
+    "type": "receive",
+    "stateMutability": "payable"
+  },
+  {
     "type": "function",
     "name": "DEPLOYER",
     "inputs": [],
@@ -64,6 +68,11 @@
         "name": "sqrtPriceX96",
         "type": "uint160",
         "internalType": "uint160"
+      },
+      {
+        "name": "initialTokens",
+        "type": "uint256",
+        "internalType": "uint256"
       }
     ],
     "outputs": [
@@ -81,9 +90,14 @@
         "name": "forever",
         "type": "address",
         "internalType": "contract ForeverLiquidity"
+      },
+      {
+        "name": "liquidity",
+        "type": "uint128",
+        "internalType": "uint128"
       }
     ],
-    "stateMutability": "nonpayable"
+    "stateMutability": "payable"
   },
   {
     "type": "event",
@@ -124,6 +138,12 @@
         "type": "int24",
         "indexed": false,
         "internalType": "int24"
+      },
+      {
+        "name": "liquidity",
+        "type": "uint128",
+        "indexed": false,
+        "internalType": "uint128"
       }
     ],
     "anonymous": false
@@ -146,6 +166,22 @@
   },
   {
     "type": "error",
+    "name": "RefundFailed",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "SafeERC20FailedOperation",
+    "inputs": [
+      {
+        "name": "token",
+        "type": "address",
+        "internalType": "address"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "SinkNotBound",
     "inputs": [
       {
@@ -162,7 +198,17 @@
   },
   {
     "type": "error",
+    "name": "UnexpectedEth",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "ZeroAddress",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ZeroInitialLiquidity",
     "inputs": []
   }
 ]

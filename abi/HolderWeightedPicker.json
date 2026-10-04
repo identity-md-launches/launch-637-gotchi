@@ -43,19 +43,6 @@
   },
   {
     "type": "function",
-    "name": "MAX_DRAWS",
-    "inputs": [],
-    "outputs": [
-      {
-        "name": "",
-        "type": "uint256",
-        "internalType": "uint256"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
     "name": "TOKEN",
     "inputs": [],
     "outputs": [
@@ -69,27 +56,17 @@
   },
   {
     "type": "function",
-    "name": "drawAt",
+    "name": "deposit",
     "inputs": [
       {
-        "name": "snapshotVersion",
-        "type": "uint256",
-        "internalType": "uint256"
-      },
-      {
-        "name": "randomness",
+        "name": "amount",
         "type": "uint256",
         "internalType": "uint256"
       }
     ],
     "outputs": [
       {
-        "name": "winner",
-        "type": "address",
-        "internalType": "address"
-      },
-      {
-        "name": "weight",
+        "name": "received",
         "type": "uint256",
         "internalType": "uint256"
       }
@@ -133,7 +110,7 @@
     "name": "holderCountAt",
     "inputs": [
       {
-        "name": "snapshotVersion",
+        "name": "snapshotBlock",
         "type": "uint256",
         "internalType": "uint256"
       }
@@ -214,7 +191,7 @@
     "name": "pickAt",
     "inputs": [
       {
-        "name": "snapshotVersion",
+        "name": "snapshotBlock",
         "type": "uint256",
         "internalType": "uint256"
       },
@@ -259,26 +236,6 @@
   },
   {
     "type": "function",
-    "name": "refresh",
-    "inputs": [
-      {
-        "name": "holder",
-        "type": "address",
-        "internalType": "address"
-      }
-    ],
-    "outputs": [],
-    "stateMutability": "nonpayable"
-  },
-  {
-    "type": "function",
-    "name": "register",
-    "inputs": [],
-    "outputs": [],
-    "stateMutability": "nonpayable"
-  },
-  {
-    "type": "function",
     "name": "totalWeight",
     "inputs": [],
     "outputs": [
@@ -295,7 +252,7 @@
     "name": "totalWeightAt",
     "inputs": [
       {
-        "name": "snapshotVersion",
+        "name": "snapshotBlock",
         "type": "uint256",
         "internalType": "uint256"
       }
@@ -303,19 +260,6 @@
     "outputs": [
       {
         "name": "total",
-        "type": "uint256",
-        "internalType": "uint256"
-      }
-    ],
-    "stateMutability": "view"
-  },
-  {
-    "type": "function",
-    "name": "version",
-    "inputs": [],
-    "outputs": [
-      {
-        "name": "",
         "type": "uint256",
         "internalType": "uint256"
       }
@@ -351,7 +295,7 @@
         "internalType": "address"
       },
       {
-        "name": "snapshotVersion",
+        "name": "snapshotBlock",
         "type": "uint256",
         "internalType": "uint256"
       }
@@ -366,8 +310,21 @@
     "stateMutability": "view"
   },
   {
+    "type": "function",
+    "name": "withdraw",
+    "inputs": [
+      {
+        "name": "amount",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
     "type": "event",
-    "name": "HolderRegistered",
+    "name": "Deposited",
     "inputs": [
       {
         "name": "holder",
@@ -376,7 +333,13 @@
         "internalType": "address"
       },
       {
-        "name": "weight",
+        "name": "amount",
+        "type": "uint256",
+        "indexed": false,
+        "internalType": "uint256"
+      },
+      {
+        "name": "newWeight",
         "type": "uint256",
         "indexed": false,
         "internalType": "uint256"
@@ -386,7 +349,7 @@
   },
   {
     "type": "event",
-    "name": "WeightRefreshed",
+    "name": "Withdrawn",
     "inputs": [
       {
         "name": "holder",
@@ -395,7 +358,7 @@
         "internalType": "address"
       },
       {
-        "name": "oldWeight",
+        "name": "amount",
         "type": "uint256",
         "indexed": false,
         "internalType": "uint256"
@@ -411,14 +374,8 @@
   },
   {
     "type": "error",
-    "name": "AlreadyRegistered",
-    "inputs": [
-      {
-        "name": "holder",
-        "type": "address",
-        "internalType": "address"
-      }
-    ]
+    "name": "BlockTooLarge",
+    "inputs": []
   },
   {
     "type": "error",
@@ -438,6 +395,27 @@
   },
   {
     "type": "error",
+    "name": "InsufficientWeight",
+    "inputs": [
+      {
+        "name": "holder",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
+        "name": "weight",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "requested",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "NotRegistered",
     "inputs": [
       {
@@ -449,8 +427,19 @@
   },
   {
     "type": "error",
-    "name": "VersionTooLarge",
+    "name": "ReentrancyGuardReentrantCall",
     "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "SafeERC20FailedOperation",
+    "inputs": [
+      {
+        "name": "token",
+        "type": "address",
+        "internalType": "address"
+      }
+    ]
   },
   {
     "type": "error",
@@ -459,13 +448,7 @@
   },
   {
     "type": "error",
-    "name": "ZeroBalance",
-    "inputs": [
-      {
-        "name": "holder",
-        "type": "address",
-        "internalType": "address"
-      }
-    ]
+    "name": "ZeroAmount",
+    "inputs": []
   }
 ]

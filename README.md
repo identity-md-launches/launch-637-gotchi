@@ -4,8 +4,9 @@ A standalone Foundry project for the **GOTCHI** ERC-20 paired with ETH in a simp
 Uniswap v4 pool on **Sepolia (chainId 11155111)**. A v4 hook skims a 0.30% ETH fee from every swap into a
 FeeSink; once the sink holds at least 0.01 ETH anyone can crank it to buy the cheapest mock Aavegotchi
 listed on a mock Baazaar; the FlipEscrow then resolves each acquisition 50/50 with commit-reveal mock
-randomness: burn it, or airdrop it to a $GOTCHI holder picked by balance weight. Every step emits the
-events a future cliff/flame/parachute UI needs. Events only; no UI art.
+randomness: burn it, or airdrop it to a $GOTCHI holder picked in proportion to the GOTCHI they have
+deposited in the picker. Every step emits the events a future cliff/flame/parachute UI needs. Events only;
+no UI art.
 
 ```
 swap on ETH/$GOTCHI ──► GotchiFeeHook ──take(ETH)──► FeeSink ──triggerBuy()──► MockBaazaar.buyCheapest
@@ -30,14 +31,14 @@ Base / Diamond / real-Baazaar integration and Chainlink VRF migration are TODOs 
 | `src/MockBaazaar.sol` | mock ETH-priced marketplace: `list`, `cancel`, `buyCheapest`, pull payments |
 | `src/MockAavegotchi.sol` | mock ERC-721 collection sold on the mock Baazaar |
 | `src/FlipEscrow.sol` | holds bought NFTs, commit-reveal flip: burn or weighted airdrop |
-| `src/HolderWeightedPicker.sol` | opt-in registry + Fenwick tree, deterministic balance-weighted pick |
+| `src/HolderWeightedPicker.sol` | GOTCHI deposit vault + block-snapshotted Fenwick tree, deterministic deposit-weighted pick |
 | `src/ForeverLiquidity.sol` | owns the pool's full-range position; nothing can ever remove it |
-| `src/GotchiStackDeployer.sol` | one-shot helper: hook (CREATE2) + FeeSink + ForeverLiquidity + pool init in one transaction |
+| `src/GotchiStackDeployer.sol` | one-shot helper: hook (CREATE2) + FeeSink + ForeverLiquidity + pool init + initial liquidity in one transaction |
 | `src/PriceMath.sol` | amounts → sqrtPriceX96, shared by `ForeverLiquidity` and the deploy script |
 | `src/HookFlags.sol`, `src/HookMiner.sol` | hook permission bits and CREATE2 salt mining |
 | `script/DeployGotchiSepolia.s.sol` | optional Sepolia deploy of everything + pool init + initial liquidity |
 | `abi/*.json` | exported ABIs for the nine contracts (`forge inspect <Name> abi --json`) |
-| `test/*.t.sol` | 136 tests, see "Tests" |
+| `test/*.t.sol` | 139 tests, see "Tests" |
 | `lib/` | vendored dependencies as ordinary files (forge-std 1.16.2, OpenZeppelin 5.7.0, v4-core 1.0.2, solmate `Owned`) |
 
 ## Build and test
@@ -75,7 +76,7 @@ done
 | `BURN_ADDRESS` | `0x000000000000000000000000000000000000dEaD` | `FlipEscrow`, `HolderWeightedPicker` |
 | Reveal window / pending timeout | 7,200 blocks each (~1 day on Sepolia) | `FlipEscrow` |
 | Max active listings | 128 (`cheapest()` scans only the active index) | `MockBaazaar` |
-| Picker registry | unbounded (append-only Fenwick tree); `MAX_DRAWS` = 8 re-draws past stale weights | `HolderWeightedPicker` |
+| Picker registry | unbounded (append-only Fenwick tree); weight = deposited GOTCHI; snapshot = end of the block before the request | `HolderWeightedPicker`, `FlipEscrow` |
 | `MIN_REALISED_FEE_PERCENT` | 90: an ETH-specified swap must pay at least 90% of 30 bps of its net ETH | `GotchiFeeHook` |
 | PoolManager | `0xE03A1074c86CFeDd5C142C4F04F1a1536e203543` (Sepolia) | hook constructor arg, deploy script |
 | Hook address flags | `0xCC` = beforeSwap, afterSwap, beforeSwapReturnDelta, afterSwapReturnDelta | `GotchiFeeHook.HOOK_FLAGS` |
@@ -103,7 +104,7 @@ event ListingMocked(uint256 indexed listingId, uint256 tokenId, uint256 price); 
 Extra events for richer feeds: `GotchiFeeHook.HookFeeTaken(PoolId indexed, address indexed sink, uint256)`,
 `GotchiFeeHook.FeeSinkBound`, `MockBaazaar.Sold / ListingCancelled / ProceedsWithdrawn`,
 `FlipEscrow.AcquisitionReceived / RandomnessCommitted / FlipRevealed / FlipExpired / StraySwept`,
-`HolderWeightedPicker.HolderRegistered / WeightRefreshed`, `ForeverLiquidity.LiquidityLocked`,
+`HolderWeightedPicker.Deposited / Withdrawn`, `ForeverLiquidity.LiquidityLocked`,
 `GotchiStackDeployer.StackDeployed`.
 
 `FeesCollected.pool` is the address that paid the sink: the PoolManager for hook fees, the donor for
@@ -200,7 +201,7 @@ transfer, so nothing was left out of it.
   price to themselves; that creates an acquisition the FeeSink did not pay for and consumes one operator
   commitment. The escrow cannot tell such a purchase from the sink's (it does not know the sink, which is
   deployed after it) and the mock accepts this: it costs the third party a listing price plus gas and gives
-  them nothing but a 50/50 flip of their own NFT among registered holders.
+  them nothing but a 50/50 flip of their own NFT among the picker's depositors.
 
 ### FlipEscrow
 
@@ -212,12 +213,14 @@ transfer, so nothing was left out of it.
   `keccak256(escrow, chainId, acquisitionId, tokenId, commitmentIndex, hash)`). If the queue is empty, or its
   head was committed in the current block, the acquisition waits as `Pending`; once a commitment from an
   earlier block exists, anyone binds it with `requestFlip` (a commitment made *after* the NFT arrived is
-  eligible). Binding records `HolderWeightedPicker.version()`: the set of eligible holders and their weights
-  for this flip is frozen at that moment.
+  eligible). Binding records `pickerSnapshotBlock = block.number - 1`: the eligible holders and their weights
+  for this flip are the GOTCHI deposited in the picker as of the end of the block before the request.
 * Anyone who knows the secret calls `reveal`: `roll = keccak256(secret, requestId)`; `roll % 10_000 < 5_000`
-  burns, otherwise `picker.drawAt(frozenVersion, roll)` chooses the recipient against the frozen registry.
-  Nothing registered or refreshed after the request counts, so seeing the secret in the mempool gives a
-  front-runner no lever. No eligible holder at the frozen version, or every draw stale, falls back to a burn.
+  burns, otherwise `picker.pickAt(pickerSnapshotBlock, roll)` chooses the recipient against that snapshot.
+  The picker custodies the deposited tokens and reads nothing live at resolution, so a deposit, withdrawal
+  or plain token transfer made once the secret is visible in the mempool cannot change who wins, and a
+  deposit in the request block itself (a flash-loaned one, for instance) never counts. Nobody with weight at
+  the snapshot falls back to a burn.
 * Forced burns: a bound acquisition whose secret is not revealed within `REVEAL_WINDOW_BLOCKS`, or a
   `Pending` one that never got a commitment within `PENDING_TIMEOUT_BLOCKS`, can be `expire`d by anyone
   and is burned (`FlipExpired`, `FlipResolved(burned = true)`).
@@ -231,38 +234,42 @@ transfer, so nothing was left out of it.
   the operator before committing. The operator can therefore grind secrets off-chain and **choose each
   flip's outcome and, through the picker, its winner**, and can withhold a reveal to force a burn. The
   escrow protects holders against *third parties* (nobody else learns the roll before the reveal, and the
-  eligible set is frozen at the request), not against the operator. The operator is trusted for fairness,
-  not only liveness, until Chainlink VRF replaces the commitment queue (TODO; no subscription/keys were
-  available in this job). The operator must also never disclose a secret before its acquisition is
-  `Requested`: a leaked secret lets anyone grind registrations against the future roll.
+  eligible set and weights are frozen at the block before the request), not against the operator. The
+  operator is trusted for fairness, not only liveness, until Chainlink VRF replaces the commitment queue
+  (TODO; no subscription/keys were available in this job). The operator must also never disclose a secret
+  before its acquisition is `Requested`: a leaked secret lets anyone grind deposits against the future roll.
 
 ### HolderWeightedPicker
 
-* **Opt-in registry.** A holder calls `register()` for themselves (so nobody can enter a contract such as
-  the launch distributor, a vesting wallet or a Safe without its consent). Registration stores the current
-  balance as the weight. Excluded forever: the zero address, the dead address, the PoolManager (it
-  custodies the pool's tokens) and the picker itself. Zero balances cannot register and carry zero weight.
-* **Versioned snapshot weighting with live confirmation.** Weights are the balance as of each holder's
-  last `refresh(holder)` (anyone may refresh anyone). Every effective `register`/`refresh` increments
-  `version` and checkpoints the touched Fenwick-tree nodes, the holder's weight and the totals under it
-  (OpenZeppelin `Checkpoints`). `pickAt(version, randomness)` selects `randomness % totalWeightAt(version)`
-  over the tree as it stood at that version (O(log n) nodes, each a binary search over its checkpoints);
-  `pick(randomness)` is the same at the current version. The FlipEscrow freezes `version()` when a flip is
-  requested and resolves with it, so nothing done after the request changes who wins.
-* The selected holder's **live** balance is read once: if it is below the snapshot weight the draw forfeits
-  and the picker re-draws deterministically (`keccak256(randomness, i)`), up to `MAX_DRAWS` = 8 draws in
-  total; only when every draw forfeits does the flip burn. This blocks "refresh then move the tokens
-  elsewhere" double counting and keeps stale entries from turning honest holders' airdrops into burns.
-  `drawAt` (what the escrow calls) additionally `refresh`es every stale holder it lands on, under a new
-  version, so entries backed by tokens that moved on (one bag registered through several wallets) lose their
-  weight for all later flips. Keepers may still `refresh` stale wallets proactively; it is the same call.
-* The registry is **append-only and unbounded**: a new holder creates exactly one new tree node, there is no
-  capacity to fill, and positions are never reused (so historical versions stay valid).
-* Gas: registering costs about 230k with ~1,000 holders (one new node, two prefix walks, three checkpoints);
-  a reveal with one eligible draw costs a few hundred thousand; the adversarial worst case (seven stale draws,
-  each refreshed) stays under ~3M.
+* **Custodied weight.** A holder's weight is the GOTCHI they have deposited into the picker with
+  `deposit(amount)` (approve first) and not taken back with `withdraw(amount)`. The tokens sit in the picker,
+  so **one token backs exactly one weight at a time**: the same bag cannot be registered through several
+  wallets, and a wallet's weight cannot be moved to another wallet with a plain ERC-20 transfer. Only the
+  depositor can deposit for or withdraw to themselves, so a contract that merely holds GOTCHI (the launch
+  distributor, a vesting wallet, a Safe) is never entered without its consent. Excluded forever: the zero
+  address, the dead address, the PoolManager (it custodies the pool's tokens) and the picker itself. A holder
+  who withdrew everything keeps their position with zero weight and can never be selected. GOTCHI sent to
+  the picker with a plain `transfer` carries no weight and cannot be recovered; use `deposit`.
+* **Snapshot per block.** Every deposit and withdrawal checkpoints the touched Fenwick-tree nodes, the
+  holder's weight and the totals under the current block number (OpenZeppelin `Checkpoints`).
+  `pickAt(snapshotBlock, randomness)` selects `randomness % totalWeightAt(snapshotBlock)` over the tree as
+  it stood at the end of that block (O(log n) nodes, each a binary search over its checkpoints);
+  `pick(randomness)` is the same against the current state. The FlipEscrow records `block.number - 1` when a
+  flip is requested and resolves with `pickAt` against it: deposits in the request block or later never
+  count, withdrawals after the request do not change the outcome, and **no live balance is read at
+  resolution**, so nothing that can happen once the roll is knowable changes who wins. This is a
+  *deposit-weighted* selection, not a wallet-balance-weighted one: the brief says "selected by $GOTCHI
+  balance", and a wallet balance cannot be snapshotted or conserved by a contract that does not custody it
+  (the token is a plain ERC-20 without balance checkpoints), so holders who want airdrop odds deposit.
+* Deterministic: the same snapshot and randomness always yield the same holder; a holder with zero weight at
+  the snapshot has an empty range and is never selected; a snapshot with zero total returns the zero address
+  (the escrow burns).
+* The registry is **append-only and unbounded**: a new depositor creates exactly one new tree node, there is
+  no capacity to fill, and positions are never reused (so historical snapshots stay valid).
+* Gas: a first deposit costs about 230k with ~1,000 holders (one new node, two prefix walks, three
+  checkpoints); later deposits and withdrawals touch O(log n) nodes; a reveal costs a few hundred thousand.
 * `Airdropped.weight` is the snapshot weight the winner was selected with.
-* No admin role; the exclusion list is fixed at construction.
+* No admin role; the exclusion list is fixed at construction; nobody can move deposits or edit weights.
 
 ### ForeverLiquidity (the simple/forever pool)
 
@@ -271,13 +278,16 @@ transfer, so nothing was left out of it.
   hidden treasury; asserted in tests).
 * `initializePool(sqrtPriceX96)` (anyone, once — the PoolManager refuses a second call). The pool key is
   fixed once the token and hook addresses are known, so `GotchiStackDeployer` initializes it in the same
-  transaction that creates the hook and this contract; nobody can pin it at another price first.
+  transaction that creates the hook and this contract, and adds the initial liquidity in that transaction
+  too: nobody can pin the pool at another price first, and nobody can move the price of an empty pool (a
+  swap against zero liquidity moves `sqrtPriceX96` to the caller's limit for free) before the first
+  deposit lands.
 * `addLiquidity(liquidity, maxTokens)` payable (anyone) quotes at whatever price the pool has;
   `addLiquidityWithin(liquidity, maxTokens, minSqrtPriceX96, maxSqrtPriceX96)` reverts `PriceOutsideBounds`
   unless the live price is inside the band, so a deposit computed for one price is never taken at another
-  (the script uses an exact band). The contract owns the single full-range position; **there is no function
-  to remove liquidity, collect or transfer the position**. Unused ETH/tokens are refunded; the contract
-  never keeps a balance.
+  (the stack deployer uses an exact band). The contract owns the single full-range position; **there is no
+  function to remove liquidity, collect or transfer the position**. Unused ETH/tokens are refunded; the
+  contract never keeps a balance.
 * Tokens are pulled from `msg.sender` only (never from a stored payer), and the contract pays the
   PoolManager from its own balance inside `unlockCallback`, which only the PoolManager can call.
 * Quoting helpers: `sqrtPriceX96ForAmounts` (via `PriceMath`; reverts `PriceOutOfRange` for ratios of
@@ -287,13 +297,19 @@ transfer, so nothing was left out of it.
 
 ### GotchiStackDeployer
 
-A one-shot helper for the script path. `deploy(salt, token, baazaar, escrow, sqrtPriceX96)` creates, in one
-transaction: the hook at `CREATE2(deployer, salt)` (refusing a salt whose address lacks `0xCC`), the FeeSink
-(whose constructor binds itself to the hook; the helper asserts the binding), `ForeverLiquidity` for that hook,
-and the pool initialization at the given price. Only `DEPLOYER` (the account that created the helper) may
-call it, so a stranger cannot consume a mined salt. The helper holds nothing and has no power over the
-contracts afterwards. A launch factory that deploys the hook and the FeeSink in one transaction does not need
-it; the hook's constructor still takes only the PoolManager.
+A one-shot helper for the script path. `deploy(salt, token, baazaar, escrow, sqrtPriceX96, initialTokens)`
+(payable) creates, in one transaction: the hook at `CREATE2(deployer, salt)` (refusing a salt whose address
+lacks `0xCC`), the FeeSink (whose constructor binds itself to the hook; the helper asserts the binding),
+`ForeverLiquidity` for that hook, the pool initialization at the given price, and — when `msg.value` or
+`initialTokens` is non-zero — the largest full-range position those amounts fund, locked through
+`addLiquidityWithin` at exactly that price (`ZeroInitialLiquidity` if the amounts fund nothing). Tokens are
+pulled from the caller (approve the helper first), rounding dust in ETH and tokens is returned to the caller,
+and the helper's `receive` accepts ETH only from the `ForeverLiquidity` it is funding, inside `deploy`. Only
+`DEPLOYER` (the account that created the helper) may call it, so a stranger cannot consume a mined salt. The
+helper holds nothing between calls and has no power over the contracts afterwards. A launch factory that
+deploys the hook and the FeeSink in one transaction does not need it; the hook's constructor still takes only
+the PoolManager. Calling `deploy` with no liquidity is allowed but leaves the empty-pool window described
+under ForeverLiquidity open until someone adds liquidity; the script never does that.
 
 ## Admin roles and trust assumptions
 
@@ -304,10 +320,10 @@ it; the hook's constructor still takes only the PoolManager.
 | FeeSink | none | — | withdraw, redirect, change threshold or cap |
 | MockAavegotchi | `MINTER` (immutable) | mint mock gotchis; as the only source of inventory, decides what the sink can buy and (within `MAX_BUY_PRICE`) at what price | burn, pause, move others' tokens |
 | MockBaazaar | none | — | delist/reprice others, take proceeds |
-| HolderWeightedPicker | none | — | edit weights, exclusions or past snapshots |
-| FlipEscrow | `OPERATOR` (immutable) | queue randomness commitments; **by grinding secrets, choose each flip's outcome and winner**; withhold a reveal (→ burn) | move an NFT outside a resolution, change a frozen eligible set, skip the 7,200-block windows |
+| HolderWeightedPicker | none | — | move or freeze anyone's deposit, edit weights, exclusions or past snapshots |
+| FlipEscrow | `OPERATOR` (immutable) | queue randomness commitments; **by grinding secrets, choose each flip's outcome and winner**; withhold a reveal (→ burn) | move an NFT outside a resolution, change a frozen eligible set or its weights, skip the 7,200-block windows |
 | ForeverLiquidity | none | — | remove liquidity, collect fees |
-| GotchiStackDeployer | `DEPLOYER` (immutable, the script's broadcaster) | call `deploy` | anything after deployment |
+| GotchiStackDeployer | `DEPLOYER` (immutable, the script's broadcaster) | call `deploy` (and so choose the opening price and initial liquidity) | anything after deployment; keep any ETH or tokens |
 
 Nothing is upgradeable, nothing uses `delegatecall` or `selfdestruct`, there is no post-deploy mint and no
 fee treasury other than the FeeSink, whose only outflow is the Baazaar purchase. **The operator is trusted
@@ -322,26 +338,27 @@ An earlier attempt at this job was rejected by static analysis (an `arbitrary-se
 helper that pulled tokens from a stored payer). The design keeps those patterns out:
 
 * no `transferFrom`/`safeTransferFrom` with a stored or caller-supplied `from` (always `msg.sender` or
-  `address(this)`);
+  `address(this)`; the picker pulls deposits from `msg.sender`, the stack deployer pulls the initial tokens
+  from `msg.sender`, who must be `DEPLOYER`);
 * every `call{value}` is either gated by a `msg.sender` check (`FeeSink.payForListing`,
-  `ForeverLiquidity.unlockCallback`), a refund of `msg.value` (`MockBaazaar.buyCheapest`,
-  `ForeverLiquidity.addLiquidity`) or a `proceeds[msg.sender]` withdrawal; the hook moves ETH only through
-  `PoolManager.take`;
+  `ForeverLiquidity.unlockCallback`), a refund of `msg.value` to `msg.sender` (`MockBaazaar.buyCheapest`,
+  `ForeverLiquidity.addLiquidity`, `GotchiStackDeployer.deploy`) or a `proceeds[msg.sender]` withdrawal; the
+  hook moves ETH only through `PoolManager.take`;
 * no strict equality on balances or block numbers in control flow (balance checks are `>=`/`<`,
   commitment eligibility is `<`); no `block.timestamp` anywhere (windows are in blocks); no
   `blockhash`/`prevrandao` in the roll;
+* no external calls in loops (the picker's selection is a pure walk over its own storage);
 * every local is initialized, every external return value is captured, state and events come before
   external calls where the order is free, and every state-changing entry point with an external call is
   `nonReentrant`.
 
-Known lint-level items, all reviewed and intentional: `calls-loop` in the picker's bounded re-draw loop
-(at most `MAX_DRAWS` `balanceOf` reads of the launch token); `reentrancy-events` where a resolution event
-follows `drawAt` inside the `nonReentrant` `reveal`, and in `GotchiStackDeployer` whose only callees are
-contracts it just created; `reentrancy-balance` on the intended before/after balance check in `buyCheapest`;
-`unsafe-typecast` after explicit range checks; `require-revert-in-loop` in `commitMany`. Slither could not be
-run on the build machine (no `pip`).
+Known lint-level items, all reviewed and intentional: `reentrancy-events` in `GotchiStackDeployer` whose
+only callees are contracts it just created and the token it was given; `reentrancy-balance` on the intended
+before/after balance checks in `buyCheapest` and `HolderWeightedPicker.deposit`; `unsafe-typecast` after
+explicit range checks; `require-revert-in-loop` in `commitMany`. Slither could not be run on the build
+machine (no `pip`).
 
-## Tests (136)
+## Tests (139)
 
 | Suite | Covers |
 |---|---|
@@ -349,11 +366,11 @@ run on the build machine (no `pip`).
 | `GotchiFeeHook.t.sol` | flags = v4-core constants, address validity, one-time binding, **fee in all four swap directions vs an un-hooked reference pool**, accumulation, rounding, no fee unbound / on token-token pools, caller gating, disabled callbacks, **price-limited partial fills in both ETH-specified directions (fee = 30 bps of the fill, buyer never pays ETH)**, limit estimate vs the pool's own fill, unbounded estimate for rejected limits, **liquidity shaped to shrink the fee is rejected** |
 | `FeeSink.t.sol` | receive + event, **threshold/no-listing/unaffordable/above-cap no-buy**, successful buy (seller credit, escrow custody, counters), repeat buys, payment callback gating, **reentrancy from a malicious marketplace** |
 | `MockBaazaar.t.sol` | minter role, list/cancel/cap, **cheapest selection and tie-break**, **active index swap-and-pop, scan cost flat after 2,000 dead listings**, tie-break under a reordered index, stray ETH refused, value and callback purchases, refunds, unpaid revert, **pull payments and a seller that rejects ETH** |
-| `HolderWeightedPicker.t.sol` | exclusions, zero balance, double registration, refresh up/down, **deterministic range selection**, re-draw past stale weights, forfeit only when every draw is stale, **sybil/stale entries cleaned by `drawAt`**, **versioned snapshots (`pickAt`, `weightOfAt`, `totalWeightAt`, `holderCountAt`) ignore later registrations and refreshes**, no capacity cap (300 holders), fuzz |
-| `FlipEscrow.t.sol` | operator gating, intake gating, commitment eligibility (earlier block than the binding) and FIFO order, **pending acquisitions bind later commitments via `requestFlip`**, **burn path, airdrop path**, no-eligible-holder / all-stale burns and re-draws, **registration or refresh after the request cannot change the winner**, bad secret, window close, **forced burn on withheld reveal and on pending timeout**, stray NFT sweep |
+| `HolderWeightedPicker.t.sol` | deposit custody + event, approval/balance/zero-amount failures, exclusions, second deposit, plain transfers carry no weight, withdraw partial/full/too much/unregistered, **conservation `totalWeight == balanceOf(picker)` (incl. fuzz)**, **one bag cannot back two weights**, **deterministic range selection**, zero-weight holders never win, **block snapshots (`pickAt`, `weightOfAt`, `totalWeightAt`, `holderCountAt`) ignore later deposits and withdrawals and same-block deposits**, 32-bit key bound, no capacity cap (300 holders), fuzz |
+| `FlipEscrow.t.sol` | operator gating, intake gating, commitment eligibility (earlier block than the binding) and FIFO order, **pending acquisitions bind later commitments via `requestFlip`**, **burn path, airdrop path**, no-depositor and all-withdrawn burns, **deposit after the request, deposit in the request block, withdrawal after the request cannot change the winner**, **the reviewer's sybil + reveal front-run scenario (one bag through ten wallets) cannot steer the airdrop**, bad secret, window close, **forced burn on withheld reveal and on pending timeout**, stray NFT sweep |
 | `ForeverLiquidity.t.sol` | key/constants, seeded position, double init, price math incl. out-of-range ratios, quoting, add with refunds, **price-band guard**, underfunding, callback gating, no removal path, no LP fee accrual |
 | `EndToEnd.t.sol` | **swaps → fees → buy → flip (burn and airdrop) with the full event trail**, below-threshold no-buy in the middle, conservation of ETH, forced-burn variants, **empty-queue purchase flipped once the operator commits** |
-| `DeployScript.t.sol` | the script's `deploy(Config)` against a local PoolManager: wiring, mined hook address from the stack deployer, pool price/liquidity, supply, **stack deployer atomicity and caller restriction** |
+| `DeployScript.t.sol` | the script's `deploy(Config)` against a local PoolManager: wiring, mined hook address from the stack deployer, pool price/liquidity, supply, **stack deployer atomicity (pool never exists without liquidity) and caller restriction**, **initial liquidity locked in the deploying call with dust refunded**, zero-liquidity and stray-ETH refusals |
 | `ProjectFloor.t.sol` | constructors against the literal Sepolia PoolManager leave the supply untouched, EIP-170 size, no DELEGATECALL/CALLCODE/SELFDESTRUCT |
 
 ## Deployment (optional, Sepolia)
@@ -371,13 +388,15 @@ instead of letting later transactions build on it. Environment (all optional): `
 What `run()` does, in order: refuses any chain but Sepolia; deploys `LaunchToken` (supply to the
 broadcaster), `MockAavegotchi`, `MockBaazaar`, `HolderWeightedPicker`, `FlipEscrow` and a fresh
 `GotchiStackDeployer`; mines a CREATE2 salt against the helper's address so the hook address carries `0xCC`
-(a fresh helper means the salt is unused by construction); calls `GotchiStackDeployer.deploy`, which in **one
-transaction** creates `GotchiFeeHook(0xE03A…3543)`, `FeeSink` (binding itself to the hook) and
-`ForeverLiquidity`, and initializes the pool at the price implied by the two liquidity amounts; then approves
-and adds the initial forever liquidity with `addLiquidityWithin` at exactly that price. The script asserts the
-mined address, the flags and the binding, and logs every address and the salt. Nothing between the hook's
-creation and the sink's binding, or between `ForeverLiquidity`'s creation and the pool initialization, is
-visible to the mempool.
+(a fresh helper means the salt is unused by construction); approves the helper for `GOTCHI_INITIAL_TOKENS`;
+calls `GotchiStackDeployer.deploy` with `GOTCHI_INITIAL_ETH` as value, which in **one transaction** creates
+`GotchiFeeHook(0xE03A…3543)`, `FeeSink` (binding itself to the hook) and `ForeverLiquidity`, initializes the
+pool at the price implied by the two liquidity amounts and locks the initial forever liquidity with
+`addLiquidityWithin` at exactly that price, returning any dust. The script asserts the mined address, the
+flags, the binding and a non-zero liquidity, and logs every address and the salt. Nothing between the hook's
+creation and the sink's binding, between `ForeverLiquidity`'s creation and the pool initialization, or between
+the initialization and the first liquidity, is visible to the mempool; the only separate transaction is the
+token approval to the helper, which a watcher can do nothing with.
 
 Deployment order / constructor arguments, for a factory or manifest:
 
@@ -393,8 +412,10 @@ Deployment order / constructor arguments, for a factory or manifest:
 | 7 | `ForeverLiquidity` | `LaunchToken`, PoolManager, `GotchiFeeHook` |
 
 `GotchiStackDeployer` is a script-path helper, not a manifest contract: a factory that deploys 1–7 in one
-transaction gets the same atomicity. All constructors are nonpayable with address-only arguments and make no
-supply-moving calls. **A factory must still place the hook at an address carrying `0xCC`**; the hook does not
+transaction gets the same atomicity for the binding and the initialization (a factory that initializes the
+hook pool without liquidity should add the first liquidity in the same transaction, or accept that the
+first depositor must use a tolerant price band). All constructors are nonpayable with address-only arguments
+and make no supply-moving calls. **A factory must still place the hook at an address carrying `0xCC`**; the hook does not
 validate its own address (the proof harness and the launch floor deploy it at arbitrary addresses), so a hook
 at the wrong address deploys fine and is then inert, and the pool cannot be initialized for it. If a launch
 factory deploys these, note that its own token pool (with its own guard hook) is a different pool from the
@@ -415,12 +436,13 @@ has to be initialized by someone after the launch (`ForeverLiquidity.initializeP
 * **Minter** (`MockAavegotchi.MINTER`): mints demo gotchis and lists them (`approve` + `list`) at or below
   `MAX_BUY_PRICE` so the sink has something to buy.
 * **Keepers / UI**: call `FeeSink.triggerBuy()` when `canBuy()` is true, `FlipEscrow.requestFlip` for
-  pending acquisitions once a commitment from an earlier block exists, `HolderWeightedPicker.refresh` for
-  registered holders whose balance changed (ideally before a purchase binds a flip, since the eligible set
-  freezes at the request), `FlipEscrow.expire` for stuck ones and `FlipEscrow.sweepStray` for NFTs pushed in
-  without a purchase. All of these are permissionless.
-* **Holders**: `register()` once to be eligible for airdrops; refresh after balance changes (a balance below
-  the snapshot weight forfeits the draw).
+  pending acquisitions once a commitment from an earlier block exists, `FlipEscrow.expire` for stuck ones and
+  `FlipEscrow.sweepStray` for NFTs pushed in without a purchase. All of these are permissionless. Nothing in
+  the picker needs keeping: weights are deposits, not observed balances.
+* **Holders**: `approve` the picker and `deposit(amount)` to be eligible for airdrops with that weight;
+  `withdraw(amount)` any time to take the tokens back (weight drops from the current block on; a flip already
+  requested still resolves against the earlier snapshot). Deposited GOTCHI is not in the wallet: it cannot be
+  traded or transferred until withdrawn. Never send GOTCHI to the picker with a plain `transfer`.
 * **Sellers**: `withdrawProceeds()` to collect ETH from sales.
 
 ## Assumptions
@@ -436,6 +458,12 @@ has to be initialized by someone after the launch (`ForeverLiquidity.initializeP
   sink always buys the cheapest affordable one at or below `MAX_BUY_PRICE`, and a third party may add
   acquisitions to the escrow by buying their own listing for it (costing them the price and a commitment).
 * Commit-reveal is a mock randomness source suitable for Sepolia demos only; the operator can steer it.
+* Airdrop weight is GOTCHI *deposited in the picker*, not GOTCHI held in a wallet. The brief's "holder
+  selected by $GOTCHI balance" is implemented as "selected by deposited balance" because a plain ERC-20
+  balance can neither be snapshotted at the request nor prevented from backing several registrations, and a
+  live balance check at resolution is steerable by whoever sees the reveal in the mempool (see Revision
+  notes). Holders who do not deposit have zero odds; holders who deposit cannot trade those tokens until
+  they withdraw.
 
 ## Revision notes
 
@@ -445,6 +473,7 @@ This tree revises the accepted first delivery after an independent review. What 
   (swap-and-pop), so list/cancel cycles cannot strand the sink's ETH behind an unaffordable scan.
 * The picker is versioned (OpenZeppelin `Checkpoints`); the escrow freezes `version()` at the request and
   resolves against it, so a registration or refresh after the roll becomes knowable cannot steer the winner.
+  (Superseded by the second revision below: versioning alone was shown insufficient.)
 * A `Pending` acquisition can bind a commitment made after its receipt (eligibility is "committed in an
   earlier block than the binding"), so `requestFlip` works and empty-queue purchases are no longer guaranteed
   burns.
@@ -459,6 +488,27 @@ This tree revises the accepted first delivery after an independent review. What 
 * Not changed, by design: `FeesCollected.pool` (see Events), hook address validation in the constructor
   (see GotchiFeeHook), and the escrow's inability to distinguish a third party's self-purchase from the
   sink's (see MockBaazaar).
+
+Second revision, after a further independent review of the tree above:
+
+* **Picker: custody instead of live confirmation.** The reviewer showed that the versioned snapshot did not
+  fix the winner before the roll became public: weights were not conserved (one bag of GOTCHI could be
+  registered through any number of wallets, each with a frozen weight), and eligibility was confirmed against
+  the *live* balance at `reveal`, so whoever saw the secret in the mempool could compute the draw and move
+  the bag to the selected wallet with a plain transfer ahead of the reveal, winning N/(N+1) of airdrop rolls
+  against an honest holder of the same size. Reproduced with the reviewer's proof on the previous tree. There
+  is no fix inside the opt-in/live-balance model: a plain ERC-20 has no balance history, so the contract can
+  neither know who held what at the request nor stop one token from backing two weights without holding it.
+  The picker now custodies the weight: `deposit`/`withdraw` replace `register`/`refresh`, checkpoints are
+  keyed by block number, the escrow records `block.number - 1` at the request (`pickerSnapshotBlock` replaces
+  `pickerVersion` in `Acquisition`) and resolves with the pure view `pickAt` (`drawAt`, `MAX_DRAWS` and the
+  re-draws are gone: there are no stale entries to re-draw past). The ABI of `HolderWeightedPicker` and the
+  `Acquisition` struct changed accordingly; the brief's events are unchanged.
+* **Stack deployer: initial liquidity in the deploying transaction.** A swap against a freshly initialized,
+  empty v4 pool moves its price to the caller's limit at no cost, so the script's exact-band deposit in a
+  later transaction could be made to revert over and over. `GotchiStackDeployer.deploy` is now payable, pulls
+  the initial tokens from the deployer and locks the initial position in the same call, returning dust; the
+  script's only separate transaction is the token approval to the helper.
 
 ## TODO (out of scope for this job)
 

@@ -147,11 +147,13 @@ abstract contract GotchiFixture is Test {
         vm.stopPrank();
     }
 
-    /// @dev Registers `holder` with the picker after giving them `amount` GOTCHI.
-    function fundAndRegister(address holder, uint256 amount) internal {
+    /// @dev Gives `holder` `amount` GOTCHI and deposits all of it into the picker as their weight.
+    function fundAndDeposit(address holder, uint256 amount) internal {
         token.transfer(holder, amount);
-        vm.prank(holder);
-        picker.register();
+        vm.startPrank(holder);
+        token.approve(address(picker), amount);
+        picker.deposit(amount);
+        vm.stopPrank();
     }
 
     /// @dev Finds a secret whose roll for the given request burns (or not), and returns it with its hash.
