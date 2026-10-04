@@ -49,6 +49,8 @@ contract MarketHandler is Test {
     /// @dev NFTs pushed into the escrow with a plain `transferFrom` and not yet swept.
     uint256 public ghostStraysInEscrow;
     uint256 public ghostStraysSwept;
+    uint256 public ghostDeposited;
+    uint256 public ghostWithdrawn;
     mapping(uint256 acquisitionId => bool) public ghostResolved;
     mapping(uint256 acquisitionId => bool) public ghostBurned;
     mapping(uint256 acquisitionId => address) public ghostRecipient;
@@ -315,14 +317,13 @@ contract MarketHandler is Test {
         uint256 next = escrow.nextCommitment();
         bool expectOk = status == FlipEscrow.Status.Pending && next < escrow.commitmentCount()
             && escrow.getCommitment(next).commitBlock < block.number;
-        uint256 versionNow = picker.version();
         try escrow.requestFlip(id) {
             _check(expectOk, "requestFlip succeeded without a pending acquisition and an older commitment");
             FlipEscrow.Acquisition memory a = escrow.getAcquisition(id);
             _check(a.status == FlipEscrow.Status.Requested, "requestFlip did not bind");
             _check(a.commitmentIndex == next, "requestFlip skipped the oldest commitment");
             _check(a.requestBlock == block.number, "request block is not this block");
-            _check(a.pickerVersion == versionNow, "the flip did not freeze the picker's current version");
+            _check(a.pickerSnapshotBlock == block.number - 1, "the flip did not freeze the block before the request");
             _check(escrow.nextCommitment() == next + 1, "nextCommitment did not advance by one");
             ghostRequestFlipSuccesses += 1;
         } catch {
@@ -347,10 +348,10 @@ contract MarketHandler is Test {
         uint256 roll = escrow.rollFor(secret, a.requestId);
         bool expectBurn = escrow.isBurnRoll(roll);
         address expectRecipient = DEAD;
-        _check(a.pickerVersion <= picker.version(), "frozen picker version is ahead of the picker");
+        _check(a.pickerSnapshotBlock + 1 == a.requestBlock, "frozen snapshot is not the block before the request");
         if (!expectBurn) {
-            // The winner is fixed by the registry as it stood when the flip was requested, not now.
-            (address winner,) = picker.pickAt(a.pickerVersion, roll);
+            // The winner is fixed by the deposits as they stood before the flip was requested, not now.
+            (address winner,) = picker.pickAt(a.pickerSnapshotBlock, roll);
             if (winner == address(0)) expectBurn = true;
             else expectRecipient = winner;
         }
@@ -454,26 +455,44 @@ contract MarketHandler is Test {
         token.transfer(to, amount);
     }
 
-    function register(uint256 holderSeed) external count("register") {
+    /// @dev A deposit moves exactly `amount` into the picker's custody and adds it to the holder's weight.
+    function deposit(uint256 holderSeed, uint256 amount) external count("deposit") {
         address h = holders[holderSeed % holders.length];
-        bool expectOk = !picker.isRegistered(h) && token.balanceOf(h) > 0;
-        vm.prank(h);
-        try picker.register() {
-            _check(expectOk, "register succeeded for an ineligible holder");
-            _check(picker.weightOf(h) == token.balanceOf(h), "registered weight is not the balance");
+        uint256 balance = token.balanceOf(h);
+        amount = bound(amount, 0, balance);
+        uint256 weightBefore = picker.weightOf(h);
+        uint256 totalBefore = picker.totalWeight();
+        vm.startPrank(h);
+        token.approve(address(picker), amount);
+        try picker.deposit(amount) {
+            _check(amount > 0, "a zero deposit succeeded");
+            _check(picker.weightOf(h) == weightBefore + amount, "deposit did not add the amount to the weight");
+            _check(picker.totalWeight() == totalBefore + amount, "deposit did not add the amount to the total");
+            _check(token.balanceOf(h) == balance - amount, "deposit did not take the tokens");
+            ghostDeposited += amount;
         } catch {
-            _check(!expectOk, "register reverted for an eligible holder");
+            _check(amount == 0, "a funded deposit reverted");
         }
+        vm.stopPrank();
     }
 
-    function refresh(uint256 holderSeed) external count("refresh") {
+    /// @dev A holder gets back at most their weight; asking for more (or for nothing) is refused.
+    function withdraw(uint256 holderSeed, uint256 amount) external count("withdraw") {
         address h = holders[holderSeed % holders.length];
-        bool registered = picker.isRegistered(h);
-        try picker.refresh(h) {
-            _check(registered, "refreshed an unregistered holder");
-            _check(picker.weightOf(h) == token.balanceOf(h), "refreshed weight is not the live balance");
+        uint256 weight = picker.weightOf(h);
+        amount = bound(amount, 0, weight + 1);
+        bool expectOk = amount > 0 && amount <= weight;
+        uint256 balance = token.balanceOf(h);
+        uint256 pastTotal = picker.totalWeightAt(block.number - 1);
+        vm.prank(h);
+        try picker.withdraw(amount) {
+            _check(expectOk, "withdraw succeeded for nothing or beyond the holder's weight");
+            _check(picker.weightOf(h) == weight - amount, "withdraw did not lower the weight by the amount");
+            _check(token.balanceOf(h) == balance + amount, "withdraw did not return the tokens");
+            _check(picker.totalWeightAt(block.number - 1) == pastTotal, "withdraw rewrote an earlier block");
+            ghostWithdrawn += amount;
         } catch {
-            _check(!registered, "refresh reverted for a registered holder");
+            _check(!expectOk, "withdraw of deposited weight reverted");
         }
     }
 
@@ -629,18 +648,18 @@ contract MarketInvariantTest is StdInvariant, Test {
         assertEq(address(escrow).balance, 0, "escrow never holds ETH");
     }
 
-    function invariant_requestedFlipsFreezeAVersionThePickerStillAnswersFor() public view {
+    function invariant_requestedFlipsFreezeTheBlockBeforeTheRequest() public view {
         uint256 n = escrow.acquisitionCount();
         for (uint256 id = 0; id < n; id++) {
             FlipEscrow.Acquisition memory a = escrow.getAcquisition(id);
             if (a.requestId == bytes32(0)) {
-                assertEq(a.pickerVersion, 0, "an unbound acquisition carries a version");
+                assertEq(a.pickerSnapshotBlock, 0, "an unbound acquisition carries a snapshot");
                 continue;
             }
-            assertLe(a.pickerVersion, picker.version(), "frozen version is ahead of the picker");
+            assertEq(a.pickerSnapshotBlock + 1, a.requestBlock, "the snapshot is the block before the request");
             assertGe(a.requestBlock, a.receivedBlock, "requested before received");
             if (a.status == FlipEscrow.Status.Resolved && !a.burned) {
-                assertGt(picker.weightOfAt(a.recipient, a.pickerVersion), 0, "airdrop winner had no weight then");
+                assertGt(picker.weightOfAt(a.recipient, a.pickerSnapshotBlock), 0, "airdrop winner had no weight then");
             }
         }
     }
@@ -703,6 +722,8 @@ contract MarketInvariantTest is StdInvariant, Test {
         }
         assertEq(picker.totalWeight(), sum, "totalWeight is the sum of stored weights");
         assertEq(picker.prefixWeight(n), sum, "the Fenwick tree agrees");
+        assertEq(token.balanceOf(address(picker)), sum, "the picker holds exactly the deposited weights");
+        assertEq(sum, handler.ghostDeposited() - handler.ghostWithdrawn(), "weights equal deposits minus withdrawals");
     }
 
     // ---------------------------------------------------------------------------------------------

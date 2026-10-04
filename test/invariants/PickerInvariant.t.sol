@@ -6,9 +6,10 @@ import {StdInvariant} from "forge-std/StdInvariant.sol";
 import {LaunchToken} from "../../src/LaunchToken.sol";
 import {HolderWeightedPicker} from "../../src/HolderWeightedPicker.sol";
 
-/// @notice Moves GOTCHI between actors (including the excluded dead address and PoolManager), registers,
-/// refreshes, picks and draws, at the current version and at past ones. A linear scan over the
-/// checkpointed weights is the oracle for the versioned Fenwick tree, re-draws included.
+/// @notice Moves GOTCHI between actors (including the excluded dead address and PoolManager), deposits,
+/// withdraws, donates, rolls blocks and picks, at the current block and at past ones. The handler keeps
+/// its own ledger of deposits (never read back from the picker), and a linear scan over that ledger is
+/// the oracle for the block-checkpointed Fenwick tree.
 contract PickerHandler is Test {
     address internal constant DEAD = 0x000000000000000000000000000000000000dEaD;
 
@@ -17,42 +18,50 @@ contract PickerHandler is Test {
     address public poolManager;
     address[] public actors;
 
+    // The handler's own ledger: holders in order of first deposit and what each has deposited.
+    address[] public ghostHolders;
+    mapping(address holder => bool) public ghostRegistered;
+    mapping(address holder => uint256) public ghostWeight;
+    uint256 public ghostTotal;
+    /// @dev GOTCHI pushed into the picker with a plain transfer: custody without weight.
+    uint256 public ghostDonated;
+
     uint256 public ghostPicks;
-    uint256 public ghostForfeits;
-    uint256 public ghostRegistrations;
-    uint256 public ghostDraws;
-    uint256 public ghostDrawRefreshes;
-    uint256 public ghostOldVersionPicks;
-    /// @dev Every version bump the handler caused: one per registration, one per refresh that changed a
-    /// weight, and one per stale holder a `drawAt` refreshed.
-    uint256 public ghostVersionBumps;
+    uint256 public ghostDeposits;
+    uint256 public ghostWithdrawals;
+    uint256 public ghostFlashDeposits;
+    uint256 public ghostPastPicks;
     string[] public violations;
 
-    // What the registry reported at a version right after the mutation that created it; must never change.
+    // The ledger as it stood at the end of `blockNumber`, recorded when the handler leaves that block.
     struct Snapshot {
-        uint256 version;
+        uint256 blockNumber;
         uint256 total;
-        uint256 count;
-        address holder;
-        uint256 holderWeight;
+        uint256[] weights;
     }
 
-    Snapshot[] public snapshots;
+    Snapshot[] internal snapshots;
+    uint256 public immutable firstBlock;
 
     constructor(LaunchToken token_, HolderWeightedPicker picker_, address poolManager_) {
         token = token_;
         picker = picker_;
         poolManager = poolManager_;
+        firstBlock = block.number;
         for (uint256 i = 0; i < 6; i++) {
             actors.push(makeAddr(string.concat("actor", vm.toString(i))));
         }
-        // Excluded addresses take part as senders and receivers of tokens, never as registrants.
+        // Excluded addresses take part as senders and receivers of tokens, never as depositors.
         actors.push(DEAD);
         actors.push(poolManager_);
     }
 
     function actorCount() external view returns (uint256) {
         return actors.length;
+    }
+
+    function ghostHolderCount() external view returns (uint256) {
+        return ghostHolders.length;
     }
 
     function violationCount() external view returns (uint256) {
@@ -62,6 +71,19 @@ contract PickerHandler is Test {
     function snapshotCount() external view returns (uint256) {
         return snapshots.length;
     }
+
+    function snapshotAt(uint256 i)
+        external
+        view
+        returns (uint256 blockNumber, uint256 total, uint256[] memory weights)
+    {
+        Snapshot storage s = snapshots[i];
+        return (s.blockNumber, s.total, s.weights);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Token movement
+    // ---------------------------------------------------------------------------------------------
 
     function give(uint256 toSeed, uint256 amount) external {
         address to = actors[toSeed % actors.length];
@@ -79,59 +101,120 @@ contract PickerHandler is Test {
         token.transfer(to, bound(amount, 1, balance));
     }
 
-    function register(uint256 actorSeed) external {
-        address a = actors[actorSeed % actors.length];
-        bool expectOk = !picker.isExcluded(a) && !picker.isRegistered(a) && token.balanceOf(a) > 0;
+    /// @dev A plain transfer into the picker gives nobody weight.
+    function donate(uint256 fromSeed, uint256 amount) external {
+        address from = actors[fromSeed % actors.length];
+        uint256 balance = token.balanceOf(from);
+        if (balance == 0) return;
+        amount = bound(amount, 1, balance);
         uint256 totalBefore = picker.totalWeight();
+        vm.prank(from);
+        token.transfer(address(picker), amount);
+        ghostDonated += amount;
+        _check(picker.totalWeight() == totalBefore, "a plain transfer changed the total weight");
+        _check(picker.weightOf(from) == ghostWeight[from], "a plain transfer changed the sender's weight");
+    }
+
+    function rollBlocks(uint256 n) external {
+        _snapshot();
+        vm.roll(block.number + bound(n, 1, 50));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Deposits and withdrawals
+    // ---------------------------------------------------------------------------------------------
+
+    function deposit(uint256 actorSeed, uint256 amount) external {
+        address a = actors[actorSeed % actors.length];
+        uint256 balance = token.balanceOf(a);
+        amount = bound(amount, 0, balance);
+        bool expectOk = !picker.isExcluded(a) && amount > 0;
         uint256 countBefore = picker.holderCount();
-        uint256 versionBefore = picker.version();
-        vm.prank(a);
-        try picker.register() {
-            _check(expectOk, "register succeeded for an ineligible address");
-            _check(picker.weightOf(a) == token.balanceOf(a), "registered weight is not the balance");
-            _check(picker.totalWeight() == totalBefore + token.balanceOf(a), "totalWeight did not grow by the weight");
-            _check(picker.holderCount() == countBefore + 1, "holder count did not grow");
-            _check(picker.holderAt(countBefore) == a, "holder not appended in order");
-            _check(picker.version() == versionBefore + 1, "register did not bump the version by one");
-            _check(picker.weightOfAt(a, versionBefore) == 0, "the new holder has weight before their registration");
-            _check(picker.holderCountAt(versionBefore) == countBefore, "registration leaked into the previous version");
-            ghostRegistrations += 1;
-            ghostVersionBumps += 1;
-            _snapshot(a);
+        uint256 pastTotal = picker.totalWeightAt(block.number - 1);
+        vm.startPrank(a);
+        token.approve(address(picker), amount);
+        try picker.deposit(amount) returns (uint256 received) {
+            _check(expectOk, "deposit succeeded for an excluded address or a zero amount");
+            _check(received == amount, "credited amount differs from the amount sent");
+            if (!ghostRegistered[a]) {
+                ghostRegistered[a] = true;
+                ghostHolders.push(a);
+                _check(picker.holderCount() == countBefore + 1, "a first deposit did not append a holder");
+                _check(picker.holderAt(countBefore) == a, "holder not appended in order");
+            } else {
+                _check(picker.holderCount() == countBefore, "a repeat deposit appended a holder");
+            }
+            ghostWeight[a] += amount;
+            ghostTotal += amount;
+            ghostDeposits += 1;
+            _check(picker.weightOf(a) == ghostWeight[a], "weight after deposit differs from the ledger");
+            _check(token.balanceOf(a) == balance - amount, "deposit did not take the tokens");
+            _check(picker.totalWeightAt(block.number - 1) == pastTotal, "deposit rewrote the previous block");
         } catch {
-            _check(!expectOk, "register reverted for an eligible holder");
-            _check(
-                picker.totalWeight() == totalBefore && picker.holderCount() == countBefore
-                    && picker.version() == versionBefore,
-                "failed register changed state"
-            );
+            _check(!expectOk, "deposit reverted for an eligible holder with funds");
+            _check(picker.holderCount() == countBefore, "a failed deposit appended a holder");
+        }
+        vm.stopPrank();
+    }
+
+    function withdraw(uint256 actorSeed, uint256 amount) external {
+        address a = actors[actorSeed % actors.length];
+        uint256 weight = ghostWeight[a];
+        // One past the weight is reachable on purpose: nobody takes out more than they put in.
+        amount = bound(amount, 0, weight + 1);
+        bool expectOk = amount > 0 && amount <= weight;
+        uint256 balance = token.balanceOf(a);
+        uint256 pastTotal = picker.totalWeightAt(block.number - 1);
+        uint256 pastWeight = picker.weightOfAt(a, block.number - 1);
+        vm.prank(a);
+        try picker.withdraw(amount) {
+            _check(expectOk, "withdraw succeeded for nothing or beyond the holder's deposits");
+            ghostWeight[a] -= amount;
+            ghostTotal -= amount;
+            ghostWithdrawals += 1;
+            _check(picker.weightOf(a) == ghostWeight[a], "weight after withdraw differs from the ledger");
+            _check(token.balanceOf(a) == balance + amount, "withdraw did not return the tokens");
+            _check(picker.isRegistered(a), "a withdrawal unregistered the holder");
+            _check(picker.totalWeightAt(block.number - 1) == pastTotal, "withdraw rewrote the previous block's total");
+            _check(picker.weightOfAt(a, block.number - 1) == pastWeight, "withdraw rewrote the previous block's weight");
+        } catch {
+            _check(!expectOk, "withdraw of deposited weight reverted");
+            _check(token.balanceOf(a) == balance, "a failed withdraw moved tokens");
         }
     }
 
-    function refresh(uint256 actorSeed) external {
-        address a = actors[actorSeed % actors.length];
-        bool registered = picker.isRegistered(a);
-        uint256 oldWeight = picker.weightOf(a);
-        uint256 totalBefore = picker.totalWeight();
-        uint256 versionBefore = picker.version();
-        try picker.refresh(a) {
-            _check(registered, "refreshed an unregistered address");
-            uint256 live = token.balanceOf(a);
-            _check(picker.weightOf(a) == live, "refreshed weight is not the live balance");
-            _check(picker.totalWeight() == totalBefore - oldWeight + live, "totalWeight did not move by the difference");
-            if (live == oldWeight) {
-                _check(picker.version() == versionBefore, "an unchanged weight bumped the version");
-            } else {
-                _check(picker.version() == versionBefore + 1, "a changed weight did not bump the version by one");
-                _check(picker.weightOfAt(a, versionBefore) == oldWeight, "refresh rewrote the previous version");
-                ghostVersionBumps += 1;
-                _snapshot(a);
-            }
-        } catch {
-            _check(!registered, "refresh reverted for a registered holder");
-            _check(picker.version() == versionBefore, "a failed refresh bumped the version");
+    /// @dev Deposit and withdraw inside one block (what a flash loan must do): the previous block's
+    /// snapshot, which is what a flip requested in this block resolves against, is untouched.
+    function flashDeposit(uint256 actorSeed, uint256 amount, uint256 randomness) external {
+        address a = actors[actorSeed % 6];
+        uint256 balance = token.balanceOf(a);
+        if (balance == 0) return;
+        amount = bound(amount, 1, balance);
+        uint256 past = block.number - 1;
+        (address winnerBefore, uint256 weightBefore) = picker.pickAt(past, randomness);
+        uint256 pastTotal = picker.totalWeightAt(past);
+        vm.startPrank(a);
+        token.approve(address(picker), amount);
+        picker.deposit(amount);
+        if (!ghostRegistered[a]) {
+            ghostRegistered[a] = true;
+            ghostHolders.push(a);
         }
+        (address winnerDuring, uint256 weightDuring) = picker.pickAt(past, randomness);
+        picker.withdraw(amount);
+        vm.stopPrank();
+        (address winnerAfter, uint256 weightAfter) = picker.pickAt(past, randomness);
+        _check(winnerDuring == winnerBefore && weightDuring == weightBefore, "a same-block deposit changed a past pick");
+        _check(winnerAfter == winnerBefore && weightAfter == weightBefore, "a flash deposit changed a past pick");
+        _check(picker.totalWeightAt(past) == pastTotal, "a flash deposit changed a past total");
+        _check(picker.weightOf(a) == ghostWeight[a], "a flash deposit left weight behind");
+        _check(token.balanceOf(a) == balance, "a flash deposit did not return the tokens");
+        ghostFlashDeposits += 1;
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // Picks
+    // ---------------------------------------------------------------------------------------------
 
     function pick(uint256 randomness) external {
         (address winner, uint256 weight) = picker.pick(randomness);
@@ -140,106 +223,68 @@ contract PickerHandler is Test {
         _check(weight == expectedWeight, "pick weight disagrees with the oracle");
         (address again, uint256 weightAgain) = picker.pick(randomness);
         _check(again == winner && weightAgain == weight, "pick is not deterministic");
-        (address atVersion, uint256 weightAtVersion) = picker.pickAt(picker.version(), randomness);
-        _check(atVersion == winner && weightAtVersion == weight, "pick differs from pickAt at the current version");
+        (address atBlock, uint256 weightAtBlock) = picker.pickAt(block.number, randomness);
+        _check(atBlock == winner && weightAtBlock == weight, "pick differs from pickAt at the current block");
         if (winner != address(0)) {
-            _check(picker.isRegistered(winner), "winner is not registered");
             _check(!picker.isExcluded(winner), "winner is excluded");
-            _check(weight > 0 && weight == picker.weightOf(winner), "winner weight is not their stored weight");
-            _check(token.balanceOf(winner) >= weight, "winner's live balance is below the stored weight");
-        } else if (picker.totalWeight() > 0) {
-            ghostForfeits += 1;
+            _check(weight > 0, "a zero-weight holder won");
+        } else {
+            _check(ghostTotal == 0, "nobody won although weight is deposited");
         }
         ghostPicks += 1;
     }
 
-    /// @dev `drawAt` at the current version must answer exactly like `pickAt`, and its only side effect is
-    /// refreshing stale holders it landed on: every version bump it causes is one more holder whose
-    /// stored weight now equals their live balance, and nothing older changes.
-    function draw(uint256 randomness) external {
-        uint256 v = picker.version();
-        (address expectedWinner, uint256 expectedWeight) = picker.pickAt(v, randomness);
-        (address oracleWinner, uint256 oracleWeight) = oracleAt(v, randomness);
-        uint256 totalBefore = picker.totalWeight();
-        (address winner, uint256 weight) = picker.drawAt(v, randomness);
-        _check(winner == expectedWinner && weight == expectedWeight, "drawAt disagrees with pickAt");
-        _check(winner == oracleWinner && weight == oracleWeight, "drawAt disagrees with the oracle");
-        uint256 bumps = picker.version() - v;
-        ghostVersionBumps += bumps;
-        ghostDrawRefreshes += bumps;
-        _check(picker.totalWeightAt(v) == totalBefore, "drawAt rewrote the version it drew against");
-        if (winner != address(0)) {
-            _check(picker.weightOfAt(winner, v) == weight, "winner's weight is not their snapshot weight");
-            _check(token.balanceOf(winner) >= weight, "winner's live balance is below the snapshot weight");
-        }
-        if (bumps == 0) {
-            _check(picker.totalWeight() == totalBefore, "drawAt changed totals without a version bump");
-        } else {
-            _check(picker.totalWeight() < totalBefore, "a refresh during drawAt did not lower the total");
-        }
-        ghostDraws += 1;
+    /// @dev Picks at a block inside the span a recorded snapshot covers and checks it against the ledger
+    /// as it stood then.
+    function pickAtPastBlock(uint256 snapshotSeed, uint256 blockSeed, uint256 randomness) external {
+        uint256 n = snapshots.length;
+        if (n == 0) return;
+        uint256 i = snapshotSeed % n;
+        // Nothing changes between leaving a block and the next block the handler acts in.
+        uint256 lastCovered = (i + 1 < n ? snapshots[i + 1].blockNumber : block.number) - 1;
+        uint256 b = bound(blockSeed, snapshots[i].blockNumber, lastCovered);
+        (address winner, uint256 weight) = picker.pickAt(b, randomness);
+        (address expectedWinner, uint256 expectedWeight) = oracleAtSnapshot(i, randomness);
+        _check(winner == expectedWinner, "pickAt at a past block disagrees with the ledger of that block");
+        _check(weight == expectedWeight, "pickAt weight at a past block disagrees with the ledger of that block");
+        _check(picker.totalWeightAt(b) == snapshots[i].total, "totalWeightAt differs from the ledger of that block");
+        ghostPastPicks += 1;
     }
 
-    /// @dev Picks against a past version and checks it against the oracle computed from the checkpoints.
-    function pickAtOldVersion(uint256 versionSeed, uint256 randomness) external {
-        uint256 v = bound(versionSeed, 0, picker.version());
-        (address winner, uint256 weight) = picker.pickAt(v, randomness);
-        (address expectedWinner, uint256 expectedWeight) = oracleAt(v, randomness);
-        _check(winner == expectedWinner, "pickAt at a past version disagrees with the oracle");
-        _check(weight == expectedWeight, "pickAt weight at a past version disagrees with the oracle");
-        if (winner != address(0)) {
-            _check(picker.weightOfAt(winner, v) == weight, "past winner's weight is not their weight then");
-            _check(token.balanceOf(winner) >= weight, "past winner's live balance is below that weight");
-        }
-        ghostOldVersionPicks += 1;
-    }
-
-    /// @dev Independent selection against the current version.
+    /// @dev Independent selection against the handler's current ledger.
     function oracle(uint256 randomness) public view returns (address, uint256) {
-        return oracleAt(picker.version(), randomness);
-    }
-
-    /// @dev Independent selection against version `v`: for each of `MAX_DRAWS` deterministic rolls, walk
-    /// the holders registered by then in registration order and find the first whose cumulative weight
-    /// range (weights as of `v`) contains the target; the first such holder whose live balance still
-    /// covers that weight wins. If every draw lands on a stale holder nobody wins.
-    function oracleAt(uint256 v, uint256 randomness) public view returns (address, uint256) {
-        uint256 total = picker.totalWeightAt(v);
-        if (total == 0) return (address(0), 0);
-        uint256 n = picker.holderCountAt(v);
-        uint256 maxDraws = picker.MAX_DRAWS();
-        for (uint256 attempt = 0; attempt < maxDraws; attempt++) {
-            uint256 roll = attempt == 0 ? randomness : uint256(keccak256(abi.encode(randomness, attempt)));
-            (address h, uint256 w) = _scan(v, roll % total, n);
-            if (token.balanceOf(h) >= w) return (h, w);
-        }
-        return (address(0), 0);
-    }
-
-    function _scan(uint256 v, uint256 target, uint256 n) private view returns (address, uint256) {
+        if (ghostTotal == 0) return (address(0), 0);
+        uint256 target = randomness % ghostTotal;
         uint256 cumulative = 0;
-        for (uint256 i = 0; i < n; i++) {
-            address h = picker.holderAt(i);
-            uint256 w = picker.weightOfAt(h, v);
-            if (target < cumulative + w) return (h, w);
+        for (uint256 i = 0; i < ghostHolders.length; i++) {
+            uint256 w = ghostWeight[ghostHolders[i]];
+            if (target < cumulative + w) return (ghostHolders[i], w);
             cumulative += w;
         }
         revert("oracle: target beyond total");
     }
 
-    function _snapshot(address holder) private {
-        uint256 v = picker.version();
-        snapshots.push(
-            Snapshot({
-                version: v,
-                total: picker.totalWeightAt(v),
-                count: picker.holderCountAt(v),
-                holder: holder,
-                holderWeight: picker.weightOfAt(holder, v)
-            })
-        );
-        _check(picker.totalWeightAt(v) == picker.totalWeight(), "latest version total differs from totalWeight");
-        _check(picker.holderCountAt(v) == picker.holderCount(), "latest version count differs from holderCount");
+    /// @dev Independent selection against the ledger recorded in snapshot `i`.
+    function oracleAtSnapshot(uint256 i, uint256 randomness) public view returns (address, uint256) {
+        Snapshot storage s = snapshots[i];
+        if (s.total == 0) return (address(0), 0);
+        uint256 target = randomness % s.total;
+        uint256 cumulative = 0;
+        for (uint256 j = 0; j < s.weights.length; j++) {
+            uint256 w = s.weights[j];
+            if (target < cumulative + w) return (ghostHolders[j], w);
+            cumulative += w;
+        }
+        revert("oracle: target beyond total");
+    }
+
+    function _snapshot() private {
+        Snapshot storage s = snapshots.push();
+        s.blockNumber = block.number;
+        s.total = ghostTotal;
+        for (uint256 i = 0; i < ghostHolders.length; i++) {
+            s.weights.push(ghostWeight[ghostHolders[i]]);
+        }
     }
 
     function _check(bool condition, string memory what) private {
@@ -258,18 +303,37 @@ contract PickerInvariantTest is StdInvariant, Test {
     address poolManager = makeAddr("poolManager");
 
     function setUp() public {
+        vm.roll(100);
         token = new LaunchToken();
         picker = new HolderWeightedPicker(address(token), poolManager);
         handler = new PickerHandler(token, picker, poolManager);
         token.transfer(address(handler), token.totalSupply());
+        // Every actor starts with a balance so deposits are reachable from the first call.
+        for (uint256 i = 0; i < handler.actorCount(); i++) {
+            handler.give(i, 1_000e18);
+        }
         targetContract(address(handler));
     }
 
-    function invariant_totalWeightIsTheSumOfStoredWeights() public view {
+    /// @dev Conservation: the picker holds what it owes its depositors, plus only what was donated to it.
+    function invariant_custodyEqualsDepositsPlusDonations() public view {
+        assertEq(
+            token.balanceOf(address(picker)),
+            picker.totalWeight() + handler.ghostDonated(),
+            "custody differs from deposited weight plus donations"
+        );
+        assertEq(picker.totalWeight(), handler.ghostTotal(), "totalWeight differs from deposits minus withdrawals");
+    }
+
+    function invariant_storedWeightsMatchTheLedger() public view {
         uint256 sum = 0;
         uint256 n = picker.holderCount();
+        assertEq(n, handler.ghostHolderCount(), "holder count differs from the ledger");
         for (uint256 i = 0; i < n; i++) {
-            sum += picker.weightOf(picker.holderAt(i));
+            address h = picker.holderAt(i);
+            assertEq(h, handler.ghostHolders(i), "holder order differs from the ledger");
+            assertEq(picker.weightOf(h), handler.ghostWeight(h), "a stored weight differs from the ledger");
+            sum += picker.weightOf(h);
         }
         assertEq(picker.totalWeight(), sum, "totalWeight equals the sum of stored weights");
     }
@@ -278,7 +342,7 @@ contract PickerInvariantTest is StdInvariant, Test {
         uint256 n = picker.holderCount();
         uint256 running = 0;
         for (uint256 i = 0; i < n; i++) {
-            running += picker.weightOf(picker.holderAt(i));
+            running += handler.ghostWeight(picker.holderAt(i));
             assertEq(picker.prefixWeight(i + 1), running, "prefix sum differs from the holder weights");
         }
         assertEq(picker.prefixWeight(n), picker.totalWeight(), "full prefix equals totalWeight");
@@ -290,6 +354,7 @@ contract PickerInvariantTest is StdInvariant, Test {
         assertFalse(picker.isRegistered(poolManager), "pool manager registered");
         assertFalse(picker.isRegistered(address(0)), "zero address registered");
         assertFalse(picker.isRegistered(address(picker)), "picker registered itself");
+        assertEq(picker.weightOf(DEAD) + picker.weightOf(poolManager) + picker.weightOf(address(picker)), 0);
         uint256 n = picker.holderCount();
         for (uint256 i = 0; i < n; i++) {
             address h = picker.holderAt(i);
@@ -302,7 +367,7 @@ contract PickerInvariantTest is StdInvariant, Test {
     }
 
     function invariant_pickMatchesTheOracleAcrossTheRange() public view {
-        uint256 total = picker.totalWeight();
+        uint256 total = handler.ghostTotal();
         uint256[5] memory samples = [uint256(0), 1, total / 3, total == 0 ? 0 : total - 1, type(uint256).max];
         for (uint256 i = 0; i < samples.length; i++) {
             (address winner, uint256 weight) = picker.pick(samples[i]);
@@ -311,7 +376,7 @@ contract PickerInvariantTest is StdInvariant, Test {
             assertEq(weight, expectedWeight, "pick weight differs from the oracle");
             if (winner != address(0)) {
                 assertGt(weight, 0, "a zero-weight holder won");
-                assertGe(token.balanceOf(winner), weight, "winner's live balance below stored weight");
+                assertTrue(winner != DEAD && winner != poolManager, "an excluded address won");
             }
         }
         if (total == 0) {
@@ -320,29 +385,36 @@ contract PickerInvariantTest is StdInvariant, Test {
         }
     }
 
-    /// @dev What a version reported when it was created is what it reports forever: later registrations,
-    /// refreshes and draws may only add versions, never rewrite one the escrow may have frozen a flip to.
-    function invariant_pastVersionsNeverChange() public view {
+    /// @dev What the registry held at the end of a block is what it reports for that block forever: later
+    /// deposits and withdrawals never rewrite a snapshot the escrow may have frozen a flip to.
+    function invariant_pastBlocksNeverChange() public view {
         uint256 n = handler.snapshotCount();
         for (uint256 i = 0; i < n; i++) {
-            (uint256 v, uint256 total, uint256 count, address holder, uint256 holderWeight) = handler.snapshots(i);
-            assertEq(picker.totalWeightAt(v), total, "a past version's total changed");
-            assertEq(picker.holderCountAt(v), count, "a past version's holder count changed");
-            assertEq(picker.weightOfAt(holder, v), holderWeight, "a past version's holder weight changed");
-            assertLe(v, picker.version(), "a snapshot version is ahead of the current one");
+            (uint256 b, uint256 total, uint256[] memory weights) = handler.snapshotAt(i);
+            assertLt(b, block.number, "a snapshot block is not in the past");
+            assertEq(picker.totalWeightAt(b), total, "a past block's total changed");
+            assertEq(picker.holderCountAt(b), weights.length, "a past block's holder count changed");
+            for (uint256 j = 0; j < weights.length; j++) {
+                assertEq(picker.weightOfAt(picker.holderAt(j), b), weights[j], "a past block's holder weight changed");
+            }
+            for (uint256 j = weights.length; j < picker.holderCount(); j++) {
+                assertEq(picker.weightOfAt(picker.holderAt(j), b), 0, "a later holder has weight in an earlier block");
+            }
+            (address winner, uint256 weight) = picker.pickAt(b, uint256(keccak256(abi.encode(i, b))));
+            (address expected, uint256 expectedWeight) =
+                handler.oracleAtSnapshot(i, uint256(keccak256(abi.encode(i, b))));
+            assertEq(winner, expected, "a past block's pick changed");
+            assertEq(weight, expectedWeight, "a past block's pick weight changed");
         }
-        assertEq(picker.totalWeightAt(0), 0, "version zero is empty");
-        assertEq(picker.holderCountAt(0), 0, "version zero has no holders");
-        assertEq(picker.totalWeightAt(picker.version()), picker.totalWeight(), "latest version is the live total");
-        assertEq(picker.holderCountAt(picker.version()), picker.holderCount(), "latest version is the live count");
-    }
-
-    function invariant_versionCountsEveryMutation() public view {
-        assertEq(picker.version(), handler.ghostVersionBumps(), "version moved by something other than a mutation");
+        uint256 beforeAnything = handler.firstBlock() - 1;
+        assertEq(picker.totalWeightAt(beforeAnything), 0, "the registry is empty before its first block");
+        assertEq(picker.holderCountAt(beforeAnything), 0, "no holders before the first block");
+        assertEq(picker.totalWeightAt(block.number), picker.totalWeight(), "the current block is the live total");
+        assertEq(picker.holderCountAt(block.number), picker.holderCount(), "the current block is the live count");
     }
 
     function invariant_supplyIsConserved() public view {
-        uint256 sum = token.balanceOf(address(handler));
+        uint256 sum = token.balanceOf(address(handler)) + token.balanceOf(address(picker));
         for (uint256 i = 0; i < handler.actorCount(); i++) {
             sum += token.balanceOf(handler.actors(i));
         }
@@ -356,12 +428,11 @@ contract PickerInvariantTest is StdInvariant, Test {
     }
 
     function afterInvariant() public {
-        emit log_named_uint("registrations", handler.ghostRegistrations());
+        emit log_named_uint("deposits", handler.ghostDeposits());
+        emit log_named_uint("withdrawals", handler.ghostWithdrawals());
+        emit log_named_uint("flash deposits", handler.ghostFlashDeposits());
         emit log_named_uint("picks", handler.ghostPicks());
-        emit log_named_uint("forfeits", handler.ghostForfeits());
-        emit log_named_uint("draws", handler.ghostDraws());
-        emit log_named_uint("stale holders refreshed by draws", handler.ghostDrawRefreshes());
-        emit log_named_uint("picks at past versions", handler.ghostOldVersionPicks());
-        emit log_named_uint("versions", picker.version());
+        emit log_named_uint("picks at past blocks", handler.ghostPastPicks());
+        emit log_named_uint("snapshots", handler.snapshotCount());
     }
 }

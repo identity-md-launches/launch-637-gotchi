@@ -7,8 +7,9 @@ import {HolderWeightedPicker} from "../../src/HolderWeightedPicker.sol";
 
 /// @notice A holder that is a contract without `onERC721Received`: an airdrop must still reach it.
 contract ContractHolder {
-    function register(HolderWeightedPicker picker) external {
-        picker.register();
+    function deposit(HolderWeightedPicker picker, uint256 amount) external {
+        picker.TOKEN().approve(address(picker), amount);
+        picker.deposit(amount);
     }
 }
 
@@ -153,7 +154,7 @@ contract FlipEscrowEdgeTest is GotchiFixture {
     function test_airdropToAContractWithoutReceiverStillResolves() public {
         ContractHolder holder = new ContractHolder();
         token.transfer(address(holder), 1_000e18);
-        holder.register(picker);
+        holder.deposit(picker, 1_000e18);
         assertEq(picker.totalWeight(), 1_000e18);
 
         (uint256 acquisitionId, uint256 tokenId, bytes32 secret) = _requestedAcquisition(false);
